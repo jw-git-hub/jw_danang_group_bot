@@ -1,0 +1,4 @@
+requests>=2.31.0
+beautifulsoup4>=4.12.0
+telethon>=1.42.0
+googlenewsdecoder>=0.1.7

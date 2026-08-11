@@ -1,0 +1,44 @@
+{
+  "telegram": {
+    "bot_token": "YOUR_TELEGRAM_BOT_TOKEN",
+    "chat_id": "-1001234567890",
+    "news_thread_id": 1451,
+    "weather_thread_id": 1
+  },
+  "weather": {
+    "latitude": 16.0544,
+    "longitude": 108.2022,
+    "timezone": "Asia/Bangkok",
+    "aqi_token": "YOUR_AQICN_TOKEN"
+  },
+  "reader": {
+    "api_id": 123456,
+    "api_hash": "YOUR_TELEGRAM_API_HASH"
+  },
+  "facebook": {
+    "page_id": "YOUR_FACEBOOK_PAGE_ID",
+    "page_access_token": "YOUR_FACEBOOK_PAGE_ACCESS_TOKEN"
+  },
+  "news": {
+    "max_age_days": 3,
+    "dedup_threshold": 0.35,
+    "tracker_file": "danang-news-posted.json",
+    "sources": [
+      "e.thedanangnews.vn",
+      "vietnamnews.vn",
+      "vnexpress.net",
+      "tuoitrenews.vn",
+      "dtinews.dantri.com.vn"
+    ]
+  },
+  "vietnamese": {
+    "thread_id": 1,
+    "lessons_file": "vietnamese_lessons.json",
+    "state_file": "vietnamese_state.json"
+  },
+  "expat_guide": {
+    "thread_id": 1,
+    "guide_file": "expat_guide.json",
+    "state_file": "expat_guide_state.json"
+  }
+}

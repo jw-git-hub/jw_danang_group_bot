@@ -1,0 +1,32 @@
+# Secrets
+config.json
+
+# Claude Code local settings (may contain secrets)
+.claude/
+
+# Sessions
+*.session
+*.session-journal
+
+# Tracker state
+danang-news-posted.json
+
+# Runtime state
+*_state.json
+
+# HTTP cache
+cache/
+
+# Virtual environment
+venv/
+
+# Logs
+logs/
+*.log
+
+# Python
+__pycache__/
+*.pyc
+
+# OS
+.DS_Store
