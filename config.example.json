@@ -5,7 +5,7 @@
     "news_thread_id": 1451,
     "weather_thread_id": 1,
     "test_chat_id": "YOUR_TEST_CHAT_ID",
-    "ops_chat_id": "YOUR_OPS_CHAT_ID"
+    "ops_chat_id": ""
   },
   "weather": {
     "latitude": 16.0544,
@@ -18,20 +18,14 @@
     "api_hash": "YOUR_TELEGRAM_API_HASH"
   },
   "facebook": {
+    "enabled": false,
     "page_id": "YOUR_FACEBOOK_PAGE_ID",
     "page_access_token": "YOUR_FACEBOOK_PAGE_ACCESS_TOKEN"
   },
   "news": {
     "max_age_days": 3,
     "dedup_threshold": 0.35,
-    "tracker_file": "danang-news-posted.json",
-    "sources": [
-      "e.thedanangnews.vn",
-      "vietnamnews.vn",
-      "vnexpress.net",
-      "tuoitrenews.vn",
-      "dtinews.dantri.com.vn"
-    ]
+    "tracker_file": "danang-news-posted.json"
   },
   "vietnamese": {
     "thread_id": 1,
