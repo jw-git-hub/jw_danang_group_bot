@@ -31,27 +31,34 @@ if ! command -v claude &> /dev/null; then
     echo ""
 fi
 
+# Create config.json from template if it doesn't exist yet, and lock it down
+if [ ! -f "$SCRIPT_DIR/config.json" ]; then
+    cp "$SCRIPT_DIR/config.example.json" "$SCRIPT_DIR/config.json"
+    echo "Created config.json from config.example.json — заполните секреты перед запуском."
+else
+    echo "config.json уже существует — не трогаем."
+fi
+chmod 600 "$SCRIPT_DIR/config.json"
+
 # Show crontab entries
+# Сервер живёт в UTC. Все строки ниже — в UTC, местное время Дананга (UTC+7) указано в комментарии.
 VENV_PYTHON="$SCRIPT_DIR/venv/bin/python3"
 echo "=== Add these lines to crontab (crontab -e) ==="
 echo ""
-echo "# All times below are LOCAL server time. The server runs on Danang time (UTC+7),"
-echo "# so these match the schedule in README.md as-is. On a UTC server, subtract 7 hours."
+echo "# Danang Weather Bot — 07:00 Дананга"
+echo "0 0 * * * cd $SCRIPT_DIR && $VENV_PYTHON weather_bot.py >> logs/weather.log 2>&1"
 echo ""
-echo "# Danang Weather Bot — daily at 07:00"
-echo "0 7 * * * cd $SCRIPT_DIR && $VENV_PYTHON weather_bot.py >> logs/weather.log 2>&1"
+echo "# History sync — 08:00 Дананга"
+echo "0 1 * * * cd $SCRIPT_DIR && $VENV_PYTHON read_history.py >> logs/reader.log 2>&1"
 echo ""
-echo "# History Sync — daily at 08:00, pulls posts made by hand into the tracker"
-echo "0 8 * * * cd $SCRIPT_DIR && $VENV_PYTHON read_history.py >> logs/history.log 2>&1"
+echo "# Danang News Bot — 09:00 и 19:00 Дананга"
+echo "0 2 * * * cd $SCRIPT_DIR && $VENV_PYTHON news_bot.py >> logs/news.log 2>&1"
+echo "0 12 * * * cd $SCRIPT_DIR && $VENV_PYTHON news_bot.py >> logs/news.log 2>&1"
 echo ""
-echo "# Danang News Bot — 2x daily at 09:00 and 19:00"
-echo "0 9 * * * cd $SCRIPT_DIR && $VENV_PYTHON news_bot.py >> logs/news.log 2>&1"
-echo "0 19 * * * cd $SCRIPT_DIR && $VENV_PYTHON news_bot.py >> logs/news.log 2>&1"
+echo "# Vietnamese Lesson Bot — 12:00 Дананга"
+echo "0 5 * * * cd $SCRIPT_DIR && $VENV_PYTHON vietnamese_bot.py >> logs/vietnamese.log 2>&1"
 echo ""
-echo "# Vietnamese Lesson Bot — daily at 12:00"
-echo "0 12 * * * cd $SCRIPT_DIR && $VENV_PYTHON vietnamese_bot.py >> logs/vietnamese.log 2>&1"
-echo ""
-echo "# Expat Guide Bot — Sunday at 11:00"
-echo "0 11 * * 0 cd $SCRIPT_DIR && $VENV_PYTHON expat_guide_bot.py >> logs/expat_guide.log 2>&1"
+echo "# Expat Guide Bot — воскресенье 11:00 Дананга"
+echo "0 4 * * 0 cd $SCRIPT_DIR && $VENV_PYTHON expat_guide_bot.py >> logs/expat_guide.log 2>&1"
 echo ""
 echo "=== Setup complete ==="

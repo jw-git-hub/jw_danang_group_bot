@@ -7,6 +7,8 @@ Cron: 0 7 * * * cd /path/to/danang-bots && python3 weather_bot.py >> logs/weathe
 
 import json
 import logging
+import os
+import re
 import sys
 import time
 from datetime import datetime, timedelta, timezone
@@ -16,6 +18,7 @@ import requests
 from bs4 import BeautifulSoup
 
 from facebook_poster import send_facebook_post
+from telegram_sender import send_rich_message, send_telegram_message
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -85,7 +88,20 @@ def fetch_aqi(cfg):
             if data.get("status") != "ok":
                 log.warning("AQI API returned status: %s", data.get("status"))
                 return None
-            return data["data"]
+            aqi_payload = data["data"]
+            # AQICN штатно отдаёт "aqi": "-" (строка), когда у станции нет
+            # свежих измерений — при этом status всё ещё "ok". Приводим к int
+            # заранее, чтобы дальше по коду (aqi_level, форматирование) везде
+            # был либо чистый int, либо явный None — без строк-сюрпризов.
+            try:
+                aqi_payload["aqi"] = int(aqi_payload.get("aqi"))
+            except (KeyError, TypeError, ValueError):
+                log.warning(
+                    "AQI: станция вернула нечисловое aqi=%r (нет свежих данных) — публикуем без AQI",
+                    aqi_payload.get("aqi") if isinstance(aqi_payload, dict) else aqi_payload,
+                )
+                aqi_payload["aqi"] = None
+            return aqi_payload
         except requests.exceptions.RequestException as e:
             if attempt < 2:
                 log.warning("AQI fetch attempt %d/3 failed: %s — retrying in %ds", attempt + 1, e, backoff[attempt])
@@ -97,6 +113,16 @@ def fetch_aqi(cfg):
 # ---------------------------------------------------------------------------
 # Курсы валют (open.er-api.com — бесплатно, без ключа; frankfurter — fallback)
 # ---------------------------------------------------------------------------
+# Разумный диапазон курса USD/VND. Если апстрим отдаст мусор (например VND=1
+# при сломанном API), результат будет truthy и пролезет в пост как «1 USD ≈
+# 1 VND» — поэтому явно отбрасываем всё, что выходит за пределы правдоподобия.
+USD_VND_SANE_RANGE = (20_000, 35_000)
+
+
+def _usd_vnd_is_sane(usd_to_vnd):
+    return USD_VND_SANE_RANGE[0] <= usd_to_vnd <= USD_VND_SANE_RANGE[1]
+
+
 def fetch_exchange_rates():
     """Возвращает {'usd_to_vnd': float, 'rub_to_vnd': float} или None при провале.
 
@@ -112,11 +138,15 @@ def fetch_exchange_rates():
         vnd = rates.get("VND")
         rub = rates.get("RUB")
         if vnd and rub:
-            return {
-                "usd_to_vnd": float(vnd),
-                "rub_to_vnd": float(vnd) / float(rub),
-            }
-        log.warning("FX primary: отсутствуют VND/RUB в ответе: %s", list(rates)[:10])
+            usd_to_vnd = float(vnd)
+            if _usd_vnd_is_sane(usd_to_vnd):
+                return {
+                    "usd_to_vnd": usd_to_vnd,
+                    "rub_to_vnd": usd_to_vnd / float(rub),
+                }
+            log.warning("FX primary: usd_to_vnd=%.2f вне разумного диапазона %s — отбрасываем", usd_to_vnd, USD_VND_SANE_RANGE)
+        else:
+            log.warning("FX primary: отсутствуют VND/RUB в ответе: %s", list(rates)[:10])
     except requests.exceptions.RequestException as e:
         log.warning("FX primary fetch failed: %s", e)
     except (ValueError, KeyError, TypeError) as e:
@@ -138,11 +168,14 @@ def fetch_exchange_rates():
         if eur_to_vnd and eur_to_rub and eur_to_usd:
             usd_to_vnd = float(eur_to_vnd) / float(eur_to_usd)
             usd_to_rub = float(eur_to_rub) / float(eur_to_usd)
-            return {
-                "usd_to_vnd": usd_to_vnd,
-                "rub_to_vnd": usd_to_vnd / usd_to_rub,
-            }
-        log.warning("FX fallback: отсутствуют курсы в ответе frankfurter: %s", list(rates)[:10])
+            if _usd_vnd_is_sane(usd_to_vnd):
+                return {
+                    "usd_to_vnd": usd_to_vnd,
+                    "rub_to_vnd": usd_to_vnd / usd_to_rub,
+                }
+            log.warning("FX fallback: usd_to_vnd=%.2f вне разумного диапазона %s — отбрасываем", usd_to_vnd, USD_VND_SANE_RANGE)
+        else:
+            log.warning("FX fallback: отсутствуют курсы в ответе frankfurter: %s", list(rates)[:10])
     except requests.exceptions.RequestException as e:
         log.warning("FX fallback fetch failed: %s", e)
     except (ValueError, KeyError, TypeError) as e:
@@ -151,22 +184,87 @@ def fetch_exchange_rates():
     return None
 
 # ---------------------------------------------------------------------------
+# Персистентный кэш цен (бензин/золото)
+# ---------------------------------------------------------------------------
+# Раньше при провале всех источников fetch_petrol_price/fetch_gold_price
+# возвращали захардкоженные константы, которые молча публиковались как
+# «сегодняшняя» цена месяцами (68 варнингов в логах, которые никто не читал).
+# Теперь при успешном скрейпе кладём значение в JSON-кэш рядом с проектом,
+# а при провале — берём последнее известное значение ИЗ КЭША и возвращаем
+# его вместе с датой получения, чтобы в посте было видно возраст цифры.
+PRICE_CACHE_PATH = Path(__file__).parent / "price_cache.json"
+PRICE_CACHE_MAX_AGE_DAYS = 7
+
+
+def _load_price_cache():
+    try:
+        with open(PRICE_CACHE_PATH) as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return {}
+    except (json.JSONDecodeError, OSError) as e:
+        log.warning("Price cache: не удалось прочитать %s: %s", PRICE_CACHE_PATH, e)
+        return {}
+
+
+def _save_price_cache(cache):
+    # Атомарная запись через .tmp + os.replace — чтобы процесс, упавший
+    # посреди записи (например по OOM или kill -9), не оставил битый JSON,
+    # которым потом не сможет воспользоваться следующий запуск как fallback.
+    tmp_path = PRICE_CACHE_PATH.with_suffix(".json.tmp")
+    try:
+        with open(tmp_path, "w") as f:
+            json.dump(cache, f, ensure_ascii=False, indent=2)
+        os.replace(tmp_path, PRICE_CACHE_PATH)
+    except OSError as e:
+        log.warning("Price cache: не удалось сохранить %s: %s", PRICE_CACHE_PATH, e)
+
+
+def _update_price_cache(key, value):
+    cache = _load_price_cache()
+    cache[key] = {
+        "value": value,
+        "fetched_at": datetime.now(timezone.utc).isoformat(),
+    }
+    _save_price_cache(cache)
+
+
+def _get_cached_price(key, max_age_days=PRICE_CACHE_MAX_AGE_DAYS):
+    """Возвращает (value, fetched_at) из кэша, если он не старше max_age_days
+    (offset-aware datetime, UTC), иначе None — старый кэш лучше не публиковать
+    вовсе, чем выдавать за актуальную цену многомесячной давности."""
+    entry = _load_price_cache().get(key)
+    if not entry:
+        return None
+    try:
+        value = entry["value"]
+        fetched_at = datetime.fromisoformat(entry["fetched_at"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    if fetched_at.tzinfo is None:
+        fetched_at = fetched_at.replace(tzinfo=timezone.utc)
+    if datetime.now(timezone.utc) - fetched_at > timedelta(days=max_age_days):
+        return None
+    return value, fetched_at
+
+# ---------------------------------------------------------------------------
 # Цена бензина RON 95-III (webgia.com — агрегатор Petrolimex)
 # ---------------------------------------------------------------------------
-# Static fallback: цена RON 95-III из последней публикации (на случай если
-# все источники недоступны). Лучше иметь приближённое значение, чем пустоту.
-PETROL_FALLBACK_VND = 22880  # обновлять вручную при больших изменениях
-
 def fetch_petrol_price():
-    """Возвращает int (VND/литр) для RON 95-III. None — никогда (есть fallback).
+    """Возвращает (value: int, fetched_at: datetime|None, label: str) — цену бензина
+    в донгах за литр, либо None, если нет ни свежих данных, ни валидного кэша.
 
-    Источники:
-      1. https://webgia.com/gia-xang-dau/  — таблица Petrolimex (стабильно).
-      2. https://www.petrolimex.com.vn/nd/gia-xang-dau/  — официальный сайт
-         (вёрстка меняется, парсинг хрупкий).
+    fetched_at is None, когда цифра получена прямо сейчас; иначе это момент
+    последнего успешного сбора — пост честно показывает возраст цены, а не выдаёт
+    старую за сегодняшнюю.
+
+    Про label. Вьетнам перевёл рынок на смесь E10, и прежний «Xăng RON 95-III»
+    в таблицах остался строкой с прочерками — именно поэтому парсер, жёстко
+    привязанный к этому названию, месяцами возвращал пустоту и подменялся
+    константой. Поэтому ищем ЛЮБУЮ строку с RON 95 (включая E10 RON 95-III),
+    а если её нет — берём E5 RON 92-II, который на бирже котируется всегда, и
+    честно подписываем в посте, какой именно бензин показан.
     """
-    import re
-
     headers = {
         "User-Agent": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -175,75 +273,71 @@ def fetch_petrol_price():
         "Accept-Language": "vi,en-US;q=0.9,en;q=0.8",
     }
 
-    # Попытка 1: webgia.com — там есть строка "Xăng RON 95-III" с ценой VND/л
+    # Приоритет марок: сперва 95-я в любом исполнении, затем E5 RON 92 как замена
+    GRADES = (
+        (("e10 ron 95", "ron 95-iii", "ron 95 iii"), "E10 RON 95"),
+        (("e5 ron 92", "ron 92-ii", "ron 92 ii"), "E5 RON 92"),
+    )
+
     try:
         resp = requests.get("https://webgia.com/gia-xang-dau/", headers=headers, timeout=20)
         resp.raise_for_status()
         soup = BeautifulSoup(resp.text, "html.parser")
+
+        rows = []
         for row in soup.find_all("tr"):
-            text = row.get_text(" ", strip=True)
-            if "RON 95-III" not in text:
-                continue
-            # Числа вида 22.880 (точка как разделитель тысяч)
-            for c in re.findall(r"\d{2}[.,]\d{3}", text):
-                raw = c.replace(".", "").replace(",", "")
-                try:
-                    val = int(raw)
-                except ValueError:
+            cells = [td.get_text(" ", strip=True) for td in row.find_all(["td", "th"])]
+            if len(cells) >= 2:
+                rows.append(cells)
+
+        for keys, label in GRADES:
+            for cells in rows:
+                name = cells[0].lower()
+                if not any(k in name for k in keys):
                     continue
-                if 15000 <= val <= 40000:
-                    return val
-        log.warning("Petrol: строка RON 95-III не найдена на webgia.com")
-    except Exception as e:
+                # Вùng 1 — базовая зона (крупные города и порты), Дананг в ней;
+                # прочерк означает, что марка снята с продажи, а не сбой парсинга.
+                for cell in cells[1:]:
+                    m = re.search(r"\d{1,3}[.,]\d{3}", cell)
+                    if not m:
+                        continue
+                    try:
+                        val = int(m.group(0).replace(".", "").replace(",", ""))
+                    except ValueError:
+                        continue
+                    if 15000 <= val <= 40000:
+                        _update_price_cache("petrol", val)
+                        log.info("Petrol: %s = %d ₫/л", label, val)
+                        return val, None, label
+        log.warning("Petrol: ни одна марка бензина не найдена с ценой на webgia.com")
+    except (requests.RequestException, ValueError, AttributeError, TypeError) as e:
         log.warning("Petrol webgia fetch failed: %s", e)
 
-    # Попытка 2: petrolimex.com.vn (хрупко — вёрстка может не содержать таблицу)
-    try:
-        resp = requests.get(
-            "https://www.petrolimex.com.vn/nd/gia-xang-dau/",
-            headers=headers,
-            timeout=20,
-        )
-        resp.raise_for_status()
-        soup = BeautifulSoup(resp.text, "html.parser")
-        for row in soup.find_all("tr"):
-            text = row.get_text(" ", strip=True)
-            lower = text.lower()
-            if "ron 95-iii" not in lower and "ron 95 iii" not in lower:
-                continue
-            for c in re.findall(r"\d{1,3}(?:[.,]\d{3})+|\d{5,6}", text):
-                raw = c.replace(".", "").replace(",", "")
-                try:
-                    val = int(raw)
-                except ValueError:
-                    continue
-                if 15000 <= val <= 40000:
-                    return val
-        log.warning("Petrol: строка RON 95-III не найдена на petrolimex.com.vn")
-    except Exception as e:
-        log.warning("Petrol petrolimex fetch failed: %s", e)
+    cached = _get_cached_price("petrol")
+    if cached:
+        value, fetched_at = cached
+        log.warning("Petrol: источники недоступны, берём кэш от %s", fetched_at)
+        return value, fetched_at, "бензин"
+    log.warning("Petrol: нет ни свежих данных, ни валидного кэша — блок не публикуем")
+    return None
 
-    log.warning(
-        "Petrol: все источники недоступны. Используется fallback значение %d VND/л",
-        PETROL_FALLBACK_VND,
-    )
-    return PETROL_FALLBACK_VND
-
-# ---------------------------------------------------------------------------
-# Цена золота SJC 9999 (webgia.com — агрегатор; sjc.com.vn блокирует ботов)
-# ---------------------------------------------------------------------------
-# Static fallback (VND/chỉ). Обновлять при больших движениях рынка.
-GOLD_FALLBACK_VND = 16_630_000
 
 def fetch_gold_price():
-    """Возвращает int (VND за chỉ ≈3.75г). None — никогда (есть fallback).
+    """Возвращает (value: int, fetched_at: datetime|None, label: str) — цену ПРОДАЖИ
+    золотого слитка SJC за chỉ (≈3.75 г), либо None, если нет ни свежих данных, ни
+    валидного кэша. См. fetch_petrol_price про смысл fetched_at.
 
-    Источники:
-      1. https://webgia.com/gia-vang/  — таблица SJC по городам, đơn vị: đồng/chỉ.
-      2. https://giavang.doji.vn/api/giavang/get-bang-gia-doji  — XML API.
+    Тонкость вёрстки webgia: таблица идёт по регионам, но реальные числа стоят
+    только у первой строки (Хошимин), а у остальных городов — включая Дананг —
+    вместо цен подставлена антискрейп-заглушка «xem tại webgia.com». Поэтому
+    привязываться к Данангу бессмысленно: берём строку стандартного слитка
+    «Vàng SJC 1L, 10L, 1KG» с настоящими числами. Цена слитка SJC по стране
+    едина, так что котировка представительна.
+
+    Из строки берём ВТОРОЕ число — «bán ra», цену продажи: именно её платит
+    читатель, который идёт покупать. Раньше бралось первое попавшееся число,
+    то есть цена покупки, а подпись в посте ей не соответствовала.
     """
-    import re
-
     headers = {
         "User-Agent": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -251,32 +345,49 @@ def fetch_gold_price():
         ),
         "Accept-Language": "vi,en-US;q=0.9,en;q=0.8",
     }
+    PRICE_RE = re.compile(r"\d{1,3}(?:[.,]\d{3}){2,}")
 
-    # Попытка 1: webgia.com — таблица "Tổng hợp Giá vàng SJC trên Toàn Quốc"
-    try:
-        resp = requests.get("https://webgia.com/gia-vang/", headers=headers, timeout=20)
-        resp.raise_for_status()
-        soup = BeautifulSoup(resp.text, "html.parser")
-        for row in soup.find_all("tr"):
-            text = row.get_text(" ", strip=True)
-            if "SJC" not in text:
-                continue
-            # Цена за chỉ вида 16.630.000
-            candidates = re.findall(r"\d{1,3}(?:[.,]\d{3}){2,}", text)
-            for c in candidates:
-                raw = c.replace(".", "").replace(",", "")
-                try:
-                    val = int(raw)
-                except ValueError:
+    for url in ("https://webgia.com/gia-vang/sjc/", "https://webgia.com/gia-vang/"):
+        try:
+            resp = requests.get(url, headers=headers, timeout=20)
+            resp.raise_for_status()
+            soup = BeautifulSoup(resp.text, "html.parser")
+
+            for row in soup.find_all("tr"):
+                cells = [td.get_text(" ", strip=True) for td in row.find_all("td")]
+                if len(cells) < 3:
                     continue
-                # Допустимый диапазон ~5–25 млн VND/chỉ (с запасом)
-                if 5_000_000 <= val <= 25_000_000:
-                    return val
-        log.warning("Gold: строка SJC не найдена на webgia.com")
-    except Exception as e:
-        log.warning("Gold webgia fetch failed: %s", e)
+                joined = " ".join(cells).lower()
+                if "sjc" not in joined or "1l" not in joined:
+                    continue
 
-    # Попытка 2: DOJI XML (цены за chỉ × 1000, например 16,630 = 16.630.000)
+                prices = []
+                for cell in cells:
+                    m = PRICE_RE.search(cell)
+                    if m:
+                        try:
+                            prices.append(int(m.group(0).replace(".", "").replace(",", "")))
+                        except ValueError:
+                            pass
+                if len(prices) < 2:
+                    # Строка-заглушка «xem tại webgia.com» — не сбой парсинга,
+                    # у этого региона цены просто скрыты; идём дальше.
+                    continue
+
+                sell = prices[1]
+                if 5_000_000 <= sell <= 25_000_000:
+                    _update_price_cache("gold", sell)
+                    log.info("Gold: SJC слиток, продажа = %d ₫/чи", sell)
+                    return sell, None, "SJC 9999 (продажа)"
+
+            log.warning("Gold: строка слитка SJC с ценами не найдена на %s", url)
+        except (requests.RequestException, ValueError, AttributeError, TypeError) as e:
+            log.warning("Gold fetch failed (%s): %s", url, e)
+
+    # Попытка 2: DOJI XML (цены за chỉ × 1000, например 16,630 = 16.630.000).
+    # Здесь Buy/Sell — именованные атрибуты (не regex по свободному тексту),
+    # но таблица содержит и не-SJC золото (кольца, слитки других проб) —
+    # фильтруем по Name, чтобы не подхватить чужую строку.
     try:
         resp = requests.get(
             "https://giavang.doji.vn/api/giavang/get-bang-gia-doji",
@@ -284,25 +395,40 @@ def fetch_gold_price():
             timeout=20,
         )
         resp.raise_for_status()
-        # XML вида <Row Name='...' Sell='16,880' Buy='16,630' />
-        for m in re.finditer(r"Buy=['\"]([\d,]+)['\"]", resp.text):
-            raw = m.group(1).replace(",", "")
+        # XML вида <Row Name='SJC ...' Sell='16,880' Buy='16,630' />
+        for row_match in re.finditer(r"<Row\b[^>]*/>", resp.text):
+            tag = row_match.group(0)
+            name_m = re.search(r"Name=['\"]([^'\"]+)['\"]", tag)
+            buy_m = re.search(r"Buy=['\"]([\d,]+)['\"]", tag)
+            if not name_m or not buy_m or "sjc" not in name_m.group(1).lower():
+                continue
+            raw = buy_m.group(1).replace(",", "")
             try:
                 val = int(raw)
             except ValueError:
                 continue
             # У DOJI цены в тысячах VND/chỉ (например 16630 → 16 630 000)
             if 5_000 <= val <= 25_000:
-                return val * 1000
-        log.warning("Gold: подходящие значения не найдены в DOJI XML")
-    except Exception as e:
+                _update_price_cache("gold", val * 1000)
+                return val * 1000, None
+        log.warning("Gold: подходящие SJC-строки не найдены в DOJI XML")
+    except (requests.RequestException, ValueError, AttributeError, TypeError) as e:
         log.warning("Gold DOJI fetch failed: %s", e)
 
+    cached = _get_cached_price("gold")
+    if cached:
+        value, fetched_at = cached
+        log.warning(
+            "Gold: все источники недоступны/неоднозначны, используем кэш от %s: %d VND/чи",
+            fetched_at.isoformat(), value,
+        )
+        return value, fetched_at
+
     log.warning(
-        "Gold: все источники недоступны. Используется fallback значение %d VND/чи",
-        GOLD_FALLBACK_VND,
+        "Gold: источники недоступны и валидного кэша (не старше %d дней) нет — блок не публикуем",
+        PRICE_CACHE_MAX_AGE_DAYS,
     )
-    return GOLD_FALLBACK_VND
+    return None
 
 # ---------------------------------------------------------------------------
 # Хелпер форматирования VND
@@ -361,6 +487,63 @@ def aqi_level(value):
     return "🟣 Очень плохо"
 
 
+def _daily_value(d, key, i):
+    """Безопасно достаёт d[key][i]. Open-Meteo регулярно кладёт null внутри
+    daily-массивов (например precipitation_probability_max за пределами
+    окна probability-модели) и иногда присылает daily короче ожидаемых 4
+    дней — оба случая должны давать None, а не падать с IndexError/KeyError."""
+    try:
+        return d[key][i]
+    except (KeyError, IndexError, TypeError):
+        return None
+
+
+def _fmt_temp(value):
+    """round() падает на None — подставляем прочерк вместо обрыва форматирования."""
+    return f"{round(value)}°" if value is not None else "—°"
+
+
+def _fmt_percent(value):
+    return f"{value}%" if value is not None else "—%"
+
+
+def _build_forecast_days(d):
+    """Возвращает список безопасных дневных прогнозов (максимум 3, начиная
+    со следующего дня): [{"day_name", "emoji", "tmax", "tmin", "rain"}, ...].
+    Дни без валидной даты пропускаются; если валидных дней не осталось —
+    возвращается пустой список, и вызывающий код должен опустить блок
+    «Прогноз» целиком, а не печатать пустой заголовок."""
+    n_days = min(4, len(d.get("time") or []))
+    days = []
+    for i in range(1, n_days):
+        date_str = _daily_value(d, "time", i)
+        if not date_str:
+            continue
+        try:
+            date = datetime.strptime(date_str, "%Y-%m-%d")
+        except (ValueError, TypeError):
+            continue
+        days.append({
+            "day_name": DAY_NAMES_RU[date.weekday()],
+            "emoji": weather_emoji(_daily_value(d, "weather_code", i)),
+            "tmax": _fmt_temp(_daily_value(d, "temperature_2m_max", i)),
+            "tmin": _fmt_temp(_daily_value(d, "temperature_2m_min", i)),
+            "rain": _fmt_percent(_daily_value(d, "precipitation_probability_max", i)),
+        })
+    return days
+
+
+def _price_age_suffix(fetched_at, danang_tz):
+    """Бензин/золото хранятся как (value, fetched_at) — fetched_at is None,
+    если цена свежая, иначе это момент последнего успешного скрейпа (значение
+    взято из кэша). Возвращает пометку с датой для кэшированных значений,
+    чтобы не выдавать старую цифру за сегодняшнюю."""
+    if not fetched_at:
+        return ""
+    local = fetched_at.astimezone(danang_tz)
+    return f" (на {local.day} {MONTH_NAMES_RU[local.month]}, из кэша)"
+
+
 def format_post(weather_data, aqi_data, fx_data=None, petrol=None, gold=None):
     c = weather_data["current"]
     d = weather_data["daily"]
@@ -381,27 +564,38 @@ def format_post(weather_data, aqi_data, fx_data=None, petrol=None, gold=None):
     wind_speed = c["wind_speed_10m"]
     wind_dir = wind_direction(c["wind_direction_10m"])
 
-    # Forecast (skip today = index 0, take next 3 days)
-    forecast_lines = []
-    for i in range(1, 4):
-        date = datetime.strptime(d["time"][i], "%Y-%m-%d")
-        day_name = DAY_NAMES_RU[date.weekday()]
-        emoji = weather_emoji(d["weather_code"][i])
-        tmax = round(d["temperature_2m_max"][i])
-        tmin = round(d["temperature_2m_min"][i])
-        rain = d["precipitation_probability_max"][i]
-        forecast_lines.append(f"• {day_name}: {emoji} {tmax}°/{tmin}°, дождь {rain}%")
+    # Forecast (skip today = index 0, take next 3 days). Если после фильтрации
+    # невалидных/отсутствующих дней ничего не осталось — блок опускаем целиком,
+    # а не печатаем пустой заголовок «📅 Прогноз:» без строк под ним.
+    forecast_days = _build_forecast_days(d)
+    if forecast_days:
+        forecast_lines = [
+            f"• {fd['day_name']}: {fd['emoji']} {fd['tmax']}/{fd['tmin']}, дождь {fd['rain']}"
+            for fd in forecast_days
+        ]
+        forecast_section = "📅 Прогноз:\n" + "\n".join(forecast_lines) + "\n\n"
+    else:
+        forecast_section = ""
 
-    forecast_block = "\n".join(forecast_lines)
-
-    # AQI
-    if aqi_data:
+    # AQI — aqi_data может быть словарём с "aqi": None (станция без свежих
+    # измерений, см. fetch_aqi), поэтому проверяем именно значение, а не
+    # только truthiness самого словаря.
+    if aqi_data and aqi_data.get("aqi") is not None:
         aqi_val = aqi_data["aqi"]
-        aqi_text = f"🫁 Воздух (AQI): {aqi_val} — {aqi_level(aqi_val)}"
+        try:
+            # Доп. страховка: даже если сюда просочится ненормализованное
+            # значение (например строка "-" в обход fetch_aqi), aqi_level()
+            # не должен уронить весь пост — считаем это отсутствием данных.
+            aqi_text = f"🫁 Воздух (AQI): {aqi_val} — {aqi_level(aqi_val)}"
+        except TypeError:
+            aqi_text = "🫁 Воздух (AQI): нет данных"
     else:
         aqi_text = "🫁 Воздух (AQI): нет данных"
 
-    # Дополнительные блоки (валюта/бензин/золото) — каждый опционален
+    # Дополнительные блоки (валюта/бензин/золото) — каждый опционален.
+    # petrol/gold — это (value, fetched_at); fetched_at не None, если цена
+    # взята из кэша (все источники сегодня недоступны) — тогда явно
+    # указываем возраст цифры, а не выдаём её за сегодняшнюю.
     extra_blocks = []
     if fx_data:
         extra_blocks.append(
@@ -410,9 +604,19 @@ def format_post(weather_data, aqi_data, fx_data=None, petrol=None, gold=None):
             f"• 1 RUB ≈ {format_vnd(round(fx_data['rub_to_vnd']))} VND"
         )
     if petrol:
-        extra_blocks.append(f"⛽ Бензин A95: {format_vnd(petrol)} ₫/л")
+        # Марка приходит из источника: рынок перешёл на E10, и подписывать всё
+        # подряд как «A95» значило бы врать читателю про то, что он заливает.
+        petrol_value, petrol_fetched_at, petrol_label = petrol
+        extra_blocks.append(
+            f"⛽ Бензин {petrol_label}: {format_vnd(petrol_value)} ₫/л"
+            f"{_price_age_suffix(petrol_fetched_at, DANANG_TZ)}"
+        )
     if gold:
-        extra_blocks.append(f"🥇 Золото SJC 9999: {format_vnd(gold)} ₫/чи")
+        gold_value, gold_fetched_at, gold_label = gold
+        extra_blocks.append(
+            f"🥇 Золото {gold_label}: {format_vnd(gold_value)} ₫/чи"
+            f"{_price_age_suffix(gold_fetched_at, DANANG_TZ)}"
+        )
 
     extra_text = ""
     if extra_blocks:
@@ -425,9 +629,7 @@ def format_post(weather_data, aqi_data, fx_data=None, petrol=None, gold=None):
         f"💧 Влажность: {humidity}%\n"
         f"💨 Ветер: {wind_speed} км/ч, {wind_dir}\n"
         f"\n"
-        f"📅 Прогноз:\n"
-        f"{forecast_block}\n"
-        f"\n"
+        f"{forecast_section}"
         f"{aqi_text}"
         f"{extra_text}\n"
         f"\n"
@@ -435,54 +637,96 @@ def format_post(weather_data, aqi_data, fx_data=None, petrol=None, gold=None):
     )
     return post
 
-# ---------------------------------------------------------------------------
-# Telegram
-# ---------------------------------------------------------------------------
-def send_telegram(cfg, text):
-    token = cfg["telegram"]["bot_token"]
-    url = f"https://api.telegram.org/bot{token}/sendMessage"
-    payload = {
-        "chat_id": cfg["telegram"]["chat_id"],
-        "text": text,
-    }
-    thread_id = cfg["telegram"].get("weather_thread_id")
-    if thread_id and thread_id != 1:
-        payload["message_thread_id"] = thread_id
 
-    backoff = [5, 15, 30]
-    for attempt in range(3):
+def format_post_rich(weather_data, aqi_data, fx_data=None, petrol=None, gold=None, style="table"):
+    """Тот же дайджест в Rich HTML (Bot API 10.1+).
+
+    style="table" — показатели таблицей, компактно и с выравниванием цифр;
+    style="list"  — то же списками, если таблицы окажутся тесными на телефоне.
+    """
+    c = weather_data["current"]
+    d = weather_data["daily"]
+    DANANG_TZ = timezone(timedelta(hours=7))
+    now = datetime.now(DANANG_TZ)
+
+    header_emoji = weather_emoji(c["weather_code"])
+    day = now.day
+    month = MONTH_NAMES_RU[now.month]
+    temp = round(c["temperature_2m"])
+    feels = round(c["apparent_temperature"])
+    humidity = c["relative_humidity_2m"]
+    wind_speed = c["wind_speed_10m"]
+    wind_dir = wind_direction(c["wind_direction_10m"])
+
+    rows = [
+        ("🌡 Сейчас", f"+{temp}°C"),
+        ("🤔 Ощущается", f"+{feels}°C"),
+        ("💧 Влажность", f"{humidity}%"),
+        ("💨 Ветер", f"{wind_speed} км/ч, {wind_dir}"),
+    ]
+
+    forecast_days = _build_forecast_days(d)
+    forecast = [
+        (fd["day_name"], f"{fd['emoji']} {fd['tmax']}/{fd['tmin']}", f"дождь {fd['rain']}")
+        for fd in forecast_days
+    ]
+
+    digest = []
+    if fx_data:
+        digest.append(("💵 1 USD", f"{format_vnd(round(fx_data['usd_to_vnd']))} ₫"))
+        digest.append(("🇷🇺 1 RUB", f"{format_vnd(round(fx_data['rub_to_vnd']))} ₫"))
+    if petrol:
+        petrol_value, petrol_fetched_at, petrol_label = petrol
+        digest.append((f"⛽ Бензин {petrol_label}",
+                       f"{format_vnd(petrol_value)} ₫/л{_price_age_suffix(petrol_fetched_at, DANANG_TZ)}"))
+    if gold:
+        gold_value, gold_fetched_at, gold_label = gold
+        digest.append((f"🥇 Золото {gold_label}",
+                       f"{format_vnd(gold_value)} ₫/чи{_price_age_suffix(gold_fetched_at, DANANG_TZ)}"))
+
+    def kv_table(pairs):
+        body = "".join(f"<tr><td>{k}</td><td>{v}</td></tr>" for k, v in pairs)
+        return f"<table striped>{body}</table>"
+
+    def kv_list(pairs):
+        return "<ul>" + "".join(f"<li>{k}: <b>{v}</b></li>" for k, v in pairs) + "</ul>"
+
+    kv = kv_table if style == "table" else kv_list
+
+    parts = [f"<h3>{header_emoji} ПОГОДА В ДАНАНГЕ — {day} {month}</h3>", kv(rows)]
+
+    # Если после фильтрации невалидных/отсутствующих дней прогноза не
+    # осталось — опускаем блок целиком (не печатаем заголовок над пустотой).
+    if forecast:
+        parts.append("<p><b>📅 Прогноз на три дня</b></p>")
+        if style == "table":
+            body = "".join(f"<tr><td>{a}</td><td>{b}</td><td>{c_}</td></tr>" for a, b, c_ in forecast)
+            parts.append(f"<table striped>{body}</table>")
+        else:
+            parts.append("<ul>" + "".join(f"<li>{a}: <b>{b}</b>, {c_}</li>" for a, b, c_ in forecast) + "</ul>")
+
+    if aqi_data and aqi_data.get("aqi") is not None:
         try:
-            resp = requests.post(url, json=payload, timeout=15)
-            # Handle Telegram 429 (rate limit)
-            if resp.status_code == 429:
-                retry_after = resp.json().get("parameters", {}).get("retry_after", backoff[attempt])
-                log.warning("Telegram 429, retry_after=%ds (attempt %d/3)", retry_after, attempt + 1)
-                if attempt < 2:
-                    time.sleep(retry_after)
-                    continue
-                else:
-                    log.error("Telegram 429 on attempt 3/3 — giving up")
-                    return None
-            result = resp.json()
-        except requests.exceptions.JSONDecodeError:
-            log.error("Telegram response not JSON: %s", resp.text[:500])
-            return None
-        except requests.exceptions.RequestException as e:
-            if attempt < 2:
-                log.warning("Telegram send attempt %d/3 failed: %s — retrying in %ds", attempt + 1, e, backoff[attempt])
-                time.sleep(backoff[attempt])
-                continue
-            else:
-                log.error("Telegram send attempt 3/3 failed: %s — giving up", e)
-                return None
+            # См. комментарий в format_post — защита от ненормализованного aqi.
+            parts.append(f"<blockquote>🫁 Воздух (AQI): <b>{aqi_data['aqi']}</b> — "
+                         f"{aqi_level(aqi_data['aqi'])}</blockquote>")
+        except TypeError:
+            parts.append("<blockquote>🫁 Воздух (AQI): нет данных</blockquote>")
+    else:
+        parts.append("<blockquote>🫁 Воздух (AQI): нет данных</blockquote>")
 
-        if not result.get("ok"):
-            log.error("Telegram API error: %s", result)
-            return None
-        msg_id = result["result"]["message_id"]
-        log.info("Telegram: sent message_id=%s to thread=%s", msg_id, payload.get("message_thread_id", "General"))
-        return msg_id
-    return None
+    if digest:
+        parts.append("<hr/>")
+        parts.append("<p><b>💱 Курсы и цены</b></p>")
+        parts.append(kv(digest))
+
+    parts.append("<footer>#Дананг #погода #Danang #weather #Vietnam</footer>")
+    return "".join(parts)
+
+
+# Примечание: старую send_telegram() убрали — после перехода на общий
+# telegram_sender.py (send_telegram_message/send_rich_message) она нигде не
+# вызывалась, дублировала retry-логику и, вдобавок, светила токен бота в лог.
 
 # ---------------------------------------------------------------------------
 # Main
@@ -490,8 +734,18 @@ def send_telegram(cfg, text):
 def main():
     log.info("=== Weather bot start ===")
     dry_run = "--dry-run" in sys.argv
+    test_mode = "--test" in sys.argv
+    # Rich-разметка — рабочий формат дайджеста (таблицы показателей, цитата с AQI,
+    # разделитель перед финансовой частью). --plain оставлен как аварийный откат
+    # на случай проблем с sendRichMessage.
+    rich_mode = "--plain" not in sys.argv
+    rich_style = "list" if "--rich-list" in sys.argv else "table"
     if dry_run:
         log.info("DRY RUN mode — Telegram/Facebook отправка отключена")
+    if test_mode:
+        log.info("TEST mode — постим в тестовую группу, Facebook пропускаем")
+    if rich_mode:
+        log.info("RICH mode — sendRichMessage, стиль %s", rich_style)
     cfg = load_config()
 
     # Fetch data
@@ -527,33 +781,66 @@ def main():
 
     log.info("Fetching petrol price...")
     try:
-        petrol = fetch_petrol_price()
+        petrol = fetch_petrol_price()  # (value, fetched_at, label) | None
         if petrol:
-            log.info("Petrol OK: %s VND/л", petrol)
+            value, fetched_at, label = petrol
+            if fetched_at:
+                log.info("Petrol OK (%s, из кэша от %s): %s VND/л", label, fetched_at.isoformat(), value)
+            else:
+                log.info("Petrol OK (%s): %s VND/л", label, value)
         else:
-            log.warning("Petrol returned None")
+            log.warning("Petrol: нет ни свежих данных, ни валидного кэша — блок не публикуем")
     except Exception as e:
         log.warning("Petrol fetch failed: %s", e)
         petrol = None
 
     log.info("Fetching gold price...")
     try:
-        gold = fetch_gold_price()
+        gold = fetch_gold_price()  # (value, fetched_at, label) | None
         if gold:
-            log.info("Gold OK: %s VND/чи", gold)
+            value, fetched_at, label = gold
+            if fetched_at:
+                log.info("Gold OK (%s, из кэша от %s): %s VND/чи", label, fetched_at.isoformat(), value)
+            else:
+                log.info("Gold OK (%s): %s VND/чи", label, value)
         else:
-            log.warning("Gold returned None")
+            log.warning("Gold: нет ни свежих данных, ни валидного кэша — блок не публикуем")
     except Exception as e:
         log.warning("Gold fetch failed: %s", e)
         gold = None
 
-    # Format
-    post_text = format_post(weather_data, aqi_data, fx_data=fx_data, petrol=petrol, gold=gold)
+    # Format. Второстепенный источник (AQI, курсы, бензин, золото) не должен
+    # ронять публикацию погоды целиком — если format_post всё же упал на
+    # чём-то неучтённом, откатываемся на минимальный пост без доп. блоков,
+    # а не оставляем сообщество без прогноза на день.
+    try:
+        post_text = format_post(weather_data, aqi_data, fx_data=fx_data, petrol=petrol, gold=gold)
+    except Exception as e:
+        log.error("format_post упал: %s — публикуем минимальный пост (только погода)", e)
+        try:
+            post_text = format_post(weather_data, None, fx_data=None, petrol=None, gold=None)
+        except Exception as e2:
+            log.error("Минимальный format_post тоже упал: %s — публикация невозможна", e2)
+            sys.exit(1)
     log.info("Post formatted (%d chars)", len(post_text))
+
+    # send_rich — рабочий флаг для этого запуска: если rich-форматирование
+    # упадёт, откатываемся на обычный текст, а не теряем весь пост.
+    send_rich = rich_mode
+    rich_html = None
+    if send_rich:
+        try:
+            rich_html = format_post_rich(weather_data, aqi_data, fx_data=fx_data,
+                                         petrol=petrol, gold=gold, style=rich_style)
+            log.info("Rich post formatted (%d chars, style=%s)", len(rich_html), rich_style)
+        except Exception as e:
+            log.warning("format_post_rich упал: %s — используем обычный текст вместо rich-версии", e)
+            rich_html = None
+            send_rich = False
 
     # Печатаем пост (всегда — удобно и для боевого, и для dry-run)
     print("=" * 60)
-    print(post_text)
+    print(rich_html or post_text)
     print("=" * 60)
 
     if dry_run:
@@ -561,12 +848,27 @@ def main():
         return
 
     # Send
-    msg_id = send_telegram(cfg, post_text)
+    thread_id = cfg["telegram"].get("weather_thread_id")
+    if send_rich:
+        msg_id = send_rich_message(cfg, rich_html, thread_id=thread_id, test=test_mode,
+                                   rubric="weather")
+        if msg_id is None:
+            # sendRichMessage может быть недоступен на боевом API или отвергнуть
+            # разметку — plain-текст уже сформирован, откатываемся на него,
+            # а не теряем публикацию целиком.
+            log.warning("sendRichMessage вернул None — откатываемся на обычный текст (plain fallback)")
+            msg_id = send_telegram_message(cfg, post_text, thread_id=thread_id, test=test_mode,
+                                          rubric="weather")
+    else:
+        msg_id = send_telegram_message(cfg, post_text, thread_id=thread_id, test=test_mode,
+                                      rubric="weather")
     if not msg_id:
         log.error("Failed to send to Telegram")
         sys.exit(1)
 
-    send_facebook_post(cfg, post_text)
+    # В тестовом режиме на Facebook ничего не публикуем — это боевой канал
+    if not test_mode:
+        send_facebook_post(cfg, post_text)
 
 
 if __name__ == "__main__":

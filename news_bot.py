@@ -27,6 +27,9 @@ from googlenewsdecoder import new_decoderv1
 
 from dedup import is_duplicate, extract_fingerprint
 from facebook_poster import send_facebook_post
+from telegram_sender import send_rich_message, send_telegram_message
+from rich_render import plain_to_rich_html
+from article_image import downloaded_image, mime_for
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -470,7 +473,14 @@ def generate_post(cfg, article, meta):
         )
 
         if result.returncode != 0:
-            log.error("Claude Code CLI error (rc=%d): %s", result.returncode, result.stderr[:500])
+            # Claude CLI пишет диагностику (лимиты, авторизация) в stdout, а не в
+            # stderr. Раньше логировался только stderr — и 67 отказов подряд, из
+            # которых сложилась месячная тишина, не оставили в логе ни одной
+            # строки с причиной.
+            log.error("Claude Code CLI error (rc=%d)\n  stdout: %s\n  stderr: %s",
+                      result.returncode,
+                      (result.stdout or "")[:1000].strip() or "<пусто>",
+                      (result.stderr or "")[:500].strip() or "<пусто>")
             return None
 
         post_text = result.stdout.strip()
@@ -517,49 +527,17 @@ def generate_post(cfg, article, meta):
 # ---------------------------------------------------------------------------
 # Telegram
 # ---------------------------------------------------------------------------
-def send_telegram_text(cfg, text):
-    """Send text message to Telegram."""
-    token = cfg["telegram"]["bot_token"]
-    url = f"https://api.telegram.org/bot{token}/sendMessage"
-    payload = {
-        "chat_id": cfg["telegram"]["chat_id"],
-        "message_thread_id": cfg["telegram"]["news_thread_id"],
-        "text": text,
-    }
-    for attempt in range(3):
-        try:
-            resp = requests.post(url, json=payload, timeout=15)
-            result = resp.json()
-        except requests.exceptions.JSONDecodeError:
-            log.error("Telegram response not JSON: %s", resp.text[:500])
-            return None
-        except requests.exceptions.RequestException as e:
-            log.error("Telegram request failed: %s", e)
-            return None
-
-        if result.get("ok"):
-            msg_id = result["result"]["message_id"]
-            log.info("Telegram text sent: message_id=%s", msg_id)
-            return msg_id
-
-        error_code = result.get("error_code")
-        if error_code == 429:
-            retry_after = result.get("parameters", {}).get("retry_after", 30)
-            log.warning("Rate limited, retry %d/3 after %d seconds", attempt + 1, retry_after)
-            time.sleep(retry_after + 1)
-            continue
-
-        log.error("Telegram sendMessage failed: %s", result)
-        return None
-
-    log.error("Telegram send failed after 3 retries")
-    return None
-
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
+# Сколько статей пробуем, если Claude не смог сделать пост из первой
+MAX_CANDIDATE_ATTEMPTS = 3
+
 def main():
     log.info("=== News bot start ===")
+    # --force игнорирует окно расписания: нужен для тестовых прогонов и ручной
+    # публикации, когда штатное окно уже закрыто.
+    force = "--force" in sys.argv
     cfg = load_config()
 
     # Load tracker
@@ -568,8 +546,10 @@ def main():
     # Check window
     window_key = get_current_window()
     if is_window_closed(tracker, window_key):
-        log.info("Window %s already closed — skipping.", window_key)
-        return
+        if not force:
+            log.info("Window %s already closed — skipping.", window_key)
+            return
+        log.info("Window %s закрыто, но задан --force — продолжаем.", window_key)
 
     # Search for news
     log.info("Searching for news...")
@@ -609,33 +589,87 @@ def main():
     log.info("Candidates after filtering: %d", len(candidates))
 
     if not candidates:
-        log.warning("No suitable articles found. Skipping.")
-        return
-
-    # Pick best article
-    article = candidates[0]
-    log.info("Selected: '%s' (score=%d)", article["title"][:80], article.get("score", 0))
-    log.info("URL: %s", article["url"])
-
-    # Extract article details
-    log.info("Extracting article metadata...")
-    meta = extract_article_meta(article["url"])
-    log.info("OG image: %s", meta["og_image"][:100] if meta["og_image"] else "None")
-
-    # Generate post with Claude
-    log.info("Generating post with Claude...")
-    post_text = generate_post(cfg, article, meta)
-    if not post_text:
-        log.error("Failed to generate post. Aborting.")
+        # Ненулевой код: «новостей не нашлось» неотличимо от «сеть легла» или
+        # «дедуп выбросил всё», а тихий выход с нулём три месяца прятал такие
+        # отказы от любого мониторинга.
+        log.error("Подходящих статей не найдено — публикации не будет")
         sys.exit(1)
 
-    # Send to Telegram (text only — link preview will show image from source)
-    msg_id = send_telegram_text(cfg, post_text)
-    send_facebook_post(cfg, post_text)
+    # Перебираем несколько кандидатов: раньше пробовался ровно один, и если
+    # Claude на нём спотыкался, запуск терялся целиком, хотя в списке лежало
+    # ещё несколько подходящих статей.
+    article = None
+    meta = None
+    post_text = None
+    for candidate in candidates[:MAX_CANDIDATE_ATTEMPTS]:
+        log.info("Selected: '%s' (score=%d)", candidate["title"][:80], candidate.get("score", 0))
+        log.info("URL: %s", candidate["url"])
+
+        log.info("Extracting article metadata...")
+        candidate_meta = extract_article_meta(candidate["url"])
+        log.info("OG image: %s",
+                 candidate_meta["og_image"][:100] if candidate_meta["og_image"] else "None")
+
+        log.info("Generating post with Claude...")
+        candidate_text = generate_post(cfg, candidate, candidate_meta)
+        if candidate_text:
+            article, meta, post_text = candidate, candidate_meta, candidate_text
+            break
+        log.warning("Кандидат не дал поста — пробуем следующий")
+
+    if not post_text:
+        log.error("Ни один из %d кандидатов не дал валидный пост. Aborting.",
+                  min(len(candidates), MAX_CANDIDATE_ATTEMPTS))
+        sys.exit(1)
+
+    # Публикуем новость как статью: rich-сообщение с картинкой внутри. Превью
+    # ссылки в rich не генерируется — поэтому изображение отдаём явно, скачивая его во
+    # временный файл, который удаляется сразу после отправки.
+    test_mode = "--test" in sys.argv
+    thread_id = cfg["telegram"].get("news_thread_id")
+    rich_html = plain_to_rich_html(post_text)
+    msg_id = None
+
+    if rich_html:
+        with downloaded_image(meta.get("og_image")) as image_path:
+            msg_id = send_rich_message(
+                cfg, rich_html, thread_id=thread_id, test=test_mode, rubric="news",
+                photo_path=image_path,
+                photo_mime=mime_for(image_path) if image_path else "image/jpeg",
+            )
+        if msg_id is None:
+            log.warning("Rich-статья не ушла — откатываемся на обычный пост с превью")
+
+    if msg_id is None:
+        # Откат: обычное сообщение. Картинка тогда приходит превью из ссылки, но
+        # крупной она станет только при ЯВНОМ link_preview_options.url — без него
+        # Telegram игнорирует prefer_large_media и рисует иконку сбоку.
+        msg_id = send_telegram_message(
+            cfg,
+            post_text,
+            thread_id=thread_id,
+            link_preview_url=article["url"],
+            prefer_large_media=True,
+            show_above_text=True,
+            test=test_mode,
+            rubric="news",
+        )
 
     if not msg_id:
         log.error("Failed to send to Telegram. Aborting.")
         sys.exit(1)
+
+    # Facebook только ПОСЛЕ подтверждения, что Telegram принял пост: иначе при
+    # отказе Telegram новость улетала бы в FB, трекер не обновлялся, и следующий
+    # запуск публиковал бы её в FB повторно.
+    if not test_mode:
+        send_facebook_post(cfg, post_text)
+
+    # Тестовый прогон не трогает трекер: иначе реальная статья пометилась бы
+    # опубликованной и боевой запуск молча пропустил бы её как дубль.
+    if test_mode:
+        log.info("=== News bot TEST done: message_id=%s, трекер не изменён ===", msg_id)
+        return
 
     # Update tracker
     tracker.setdefault("windows", {})[window_key] = datetime.now(DANANG_TZ).isoformat()

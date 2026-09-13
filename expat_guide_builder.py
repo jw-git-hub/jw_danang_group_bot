@@ -4,6 +4,15 @@
 Запускается ВРУЧНУЮ для заполнения поля `body` в expat_guide.json.
 Использует Claude Code CLI (`claude -p`) для генерации текста.
 
+ВАЖНО: генерация — только первый шаг. Текст пишет языковая модель, поэтому в нём
+возможны выдуманные адреса, устаревшие пошлины и несуществующие учреждения.
+Прежде чем материал уйдёт в канал, он обязан пройти второй шаг — фактчек с
+проверкой по официальным источникам и простановкой поля sources, которое бот
+показывает в посте блоком «Проверено по источникам». Ссылки при этом
+проверяются запросом на живость, см. guide_verify_apply.py. Просить источники
+у самой модели в этом же промпте бесполезно: выдуманный URL — ровно та
+галлюцинация, от которой защищаемся.
+
 Использование:
     python3 expat_guide_builder.py --id 1
     python3 expat_guide_builder.py --id 1 --preview
@@ -28,6 +37,9 @@ PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
 GUIDE_PATH = os.path.join(PROJECT_DIR, "expat_guide.json")
 
 CLAUDE_TIMEOUT_SEC = 180
+
+# Сколько раз переспросить Claude, если ответ не прошёл валидацию
+MAX_ATTEMPTS = 3
 
 MIN_BODY_LEN = 500
 MAX_BODY_LEN = 3000
@@ -203,21 +215,39 @@ def validate_body(body: str) -> Optional[str]:
 
 
 def generate_body(title: str, block: str) -> Optional[str]:
-    prompt = build_prompt(title, block)
+    base = build_prompt(title, block)
     log.info("Запрос к claude CLI (title=%r, block=%r, prompt=%d chars)",
-             title, block, len(prompt))
-    raw = call_claude(prompt)
-    if raw is None:
-        return None
-    cleaned = clean_ai_output(raw)
-    if not cleaned:
-        log.warning("После clean_ai_output пустой результат")
-        return None
-    err = validate_body(cleaned)
-    if err is not None:
-        log.warning("Валидация провалена: %s. Превью:\n%.300s", err, cleaned)
-        return None
-    return cleaned
+             title, block, len(base))
+
+    prompt = base
+    for attempt in range(1, MAX_ATTEMPTS + 1):
+        raw = call_claude(prompt)
+        if raw is None:
+            log.warning("Попытка %d/%d: claude не ответил", attempt, MAX_ATTEMPTS)
+            continue
+
+        cleaned = clean_ai_output(raw)
+        if not cleaned:
+            log.warning("Попытка %d/%d: после clean_ai_output пусто", attempt, MAX_ATTEMPTS)
+            prompt = base + ("\n\nВАЖНО: предыдущий ответ оказался пустым после чистки. "
+                             "Верни только текст материала, без преамбул и мета-комментариев.")
+            continue
+
+        err = validate_body(cleaned)
+        if err is None:
+            return cleaned
+
+        log.warning("Попытка %d/%d: валидация провалена (%s). Превью:\n%.200s",
+                    attempt, MAX_ATTEMPTS, err, cleaned)
+        prompt = base + (
+            f"\n\nВАЖНО: предыдущий ответ отклонён — {err}. "
+            f"Требования жёсткие: длина тела от {MIN_BODY_LEN} до {MAX_BODY_LEN} символов "
+            f"(целься в 800-1500), символы * и _ запрещены полностью, "
+            "никаких преамбул и мета-комментариев."
+        )
+
+    log.warning("%d попыток исчерпано — материал не сгенерирован", MAX_ATTEMPTS)
+    return None
 
 
 # ---- Обработка одного id ---------------------------------------------------
@@ -268,13 +298,15 @@ def main(argv: list[str]) -> int:
         try:
             if process_id(data, target_id, preview=preview, force=force):
                 changed = True
+                # Сохраняем сразу: длинный прогон по диапазону не должен терять
+                # уже сгенерированные материалы из-за сбоя на середине.
+                if not preview:
+                    save_guide_atomic(data)
+                    log.info("ID=%d сохранён в %s", target_id, GUIDE_PATH)
         except Exception as exc:  # noqa: BLE001
             log.exception("ID=%d: непредвиденная ошибка: %s", target_id, exc)
 
-    if changed and not preview:
-        save_guide_atomic(data)
-        log.info("Файл %s сохранён", GUIDE_PATH)
-    elif not changed:
+    if not changed:
         log.info("Изменений нет — файл не сохраняем")
 
     return 0

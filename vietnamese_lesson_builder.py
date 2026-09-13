@@ -55,6 +55,9 @@ LESSONS_PATH = BASE_DIR / "vietnamese_lessons.json"
 CACHE_DIR = BASE_DIR / "cache" / "wikibooks"
 CACHE_TTL_SECONDS = 7 * 24 * 3600  # 7 дней
 
+# Сколько раз переспросить Claude, если ответ не распарсился или урок невалиден
+MAX_ATTEMPTS = 3
+
 # ---------------------------------------------------------------------------
 # Месячная структура курса
 # ---------------------------------------------------------------------------
@@ -172,24 +175,24 @@ LESSON_TOPICS: dict[int, list[str]] = {
         "Bãi biển Mỹ Khê (Пляж Мишеу)",
     ],
     4: [
-        "Bao nhiêu tiền? (Сколько стоит?)",
+        "Nhiêu vậy chị? / Bao nhiêu một ký? (Почём? Сколько за килограмм? — разговорный рыночный вариант)",
         "Đắt quá (Слишком дорого)",
-        "Giảm giá đi (Сделайте скидку)",
+        "Hai trăm nghìn được không chị? (Двести тысяч — идёт? Назвать свою цену при торге)",
         "Cuối cùng giá bao nhiêu? (Окончательная цена?)",
         "Tôi mua (Я беру)",
         "Tôi không mua (Я не беру)",
         "Cho tôi xem cái kia (Покажите вон то)",
         "Có cái khác không? (Есть другое?)",
-        "Màu khác (Другой цвет)",
+        "Cái này bằng vải gì? (Из какой это ткани / материала?)",
         "Cỡ lớn hơn (Размер побольше)",
         "Cỡ nhỏ hơn (Размер поменьше)",
         "Thử được không? (Можно примерить?)",
-        "Vừa rồi (Подходит)",
-        "Không vừa (Не подходит)",
+        "Cái này chật quá (Мне жмёт / тесновато)",
+        "Không vừa, cho tôi đổi cái khác được không? (Не подошло — можно обменять?)",
         "Hàng giả (Подделка)",
-        "Hàng thật (Оригинал)",
+        "Có bảo hành không? (Есть гарантия?)",
         "Trái cây (Фрукты)",
-        "Một ký bao nhiêu? (Сколько за килограмм?)",
+        "Chị cân lại giúp em với (Перевесьте, пожалуйста — контроль веса на рынке)",
         "Cho tôi nửa ký (Полкило, пожалуйста)",
         "Tươi không? (Свежее?)",
         "Tôi chỉ xem thôi (Я просто смотрю)",
@@ -197,7 +200,7 @@ LESSON_TOPICS: dict[int, list[str]] = {
         "Trả bằng thẻ được không? (Можно картой?)",
         "Tiền mặt (Наличные)",
         "Đổi tiền (Обмен валюты)",
-        "Đô la (Доллары)",
+        "Cho tôi tờ nhỏ hơn (Дайте купюрами помельче)",
         "Đồng (Донги)",
         "Mua hai tặng một (Два по цене одного)",
         "Hôm nay khuyến mãi (Сегодня акция)",
@@ -782,15 +785,22 @@ def build_lesson_record(
     return record
 
 
+REQUIRED_FIELDS = [
+    "vietnamese", "transliteration_ru", "translation_ru",
+    "breakdown", "context", "tone_tip",
+]
+
+
+def missing_fields(record: dict) -> list[str]:
+    """Список обязательных полей, которые пусты или отсутствуют."""
+    return [k for k in REQUIRED_FIELDS if not record.get(k)]
+
+
 def lesson_is_valid(record: dict) -> bool:
     """Минимальные требования к качеству урока."""
-    required = ["vietnamese", "transliteration_ru", "translation_ru", "context", "tone_tip"]
-    for k in required:
-        if not record.get(k):
-            log.warning("Урок day=%s: пустое поле %s", record.get("day"), k)
-            return False
-    if not record.get("breakdown"):
-        log.warning("Урок day=%s: пустой breakdown", record.get("day"))
+    missing = missing_fields(record)
+    if missing:
+        log.warning("Урок day=%s: пустые поля %s", record.get("day"), ", ".join(missing))
         return False
     return True
 
@@ -876,21 +886,39 @@ def generate_for_month(month: int, *, preview: bool, force: bool, limit: Optiona
             wikibooks_excerpt_if_any=excerpt_block,
         )
 
-        claude_data = call_claude(prompt)
-        if not claude_data:
-            log.warning("Урок %d: Claude не дал валидный JSON — пропуск", day)
-            continue
+        record = None
+        retry_hint = ""
+        for attempt in range(1, MAX_ATTEMPTS + 1):
+            claude_data = call_claude(prompt + retry_hint)
+            if not claude_data:
+                log.warning("Урок %d: попытка %d/%d — Claude не дал валидный JSON",
+                            day, attempt, MAX_ATTEMPTS)
+                continue
 
-        record = build_lesson_record(
-            day=day,
-            month=month,
-            claude_data=claude_data,
-            wikibooks_url=wb_url,
-            used_wikibooks=used_wikibooks,
-        )
+            candidate = build_lesson_record(
+                day=day,
+                month=month,
+                claude_data=claude_data,
+                wikibooks_url=wb_url,
+                used_wikibooks=used_wikibooks,
+            )
 
-        if not lesson_is_valid(record):
-            log.warning("Урок %d: невалидный — пропуск", day)
+            if lesson_is_valid(candidate):
+                record = candidate
+                break
+
+            missing = missing_fields(candidate)
+            log.warning("Урок %d: попытка %d/%d — не заполнены поля: %s",
+                        day, attempt, MAX_ATTEMPTS, ", ".join(missing))
+            retry_hint = (
+                "\n\nВАЖНО: в прошлый раз ты не заполнил обязательные поля: "
+                + ", ".join(missing)
+                + ". Верни JSON со ВСЕМИ полями схемы, ни одно не должно быть пустым "
+                  "или отсутствовать."
+            )
+
+        if record is None:
+            log.warning("Урок %d: %d попыток исчерпано — пропуск", day, MAX_ATTEMPTS)
             continue
 
         log.info("Урок %d сгенерирован: %s", day, record["vietnamese"])

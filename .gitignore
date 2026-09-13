@@ -30,3 +30,12 @@ __pycache__/
 
 # OS
 .DS_Store
+
+# Runtime-состояние, появившееся при наведении порядка
+heartbeats.json
+price_cache.json
+*.lock
+*state.json.corrupt-*
+
+# Скриншоты и прочие временные материалы, не место в портфолио-репозитории
+Временные файлы/

@@ -4,8 +4,10 @@ Read news thread history from Telegram using user account (Telethon).
 Populates the dedup tracker with already-posted news.
 Uses the user account ONLY for reading — never for posting.
 
-First run requires interactive auth (phone + code).
-Subsequent runs use saved session.
+First run requires interactive auth (phone + code) — run manually once
+to create reader_session.session. This script itself must NEVER prompt
+for input: it runs from cron, and an unattended input() call would hang
+the process forever while holding the session file.
 
 Usage: python3 read_history.py
 """
@@ -13,9 +15,11 @@ Usage: python3 read_history.py
 import asyncio
 import json
 import logging
+import os
 import re
+import shutil
 import sys
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from telethon import TelegramClient
@@ -31,6 +35,16 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 BASE_DIR = Path(__file__).parent
+
+# Лимит хранения записей трекера. Раньше был равен окну чтения ридера (200
+# сообщений) — это значит, что каждый новый пост вытеснял запись, которую
+# ридер потом заново импортировал при следующем прогоне, и память дедупа
+# непрерывно "тасовалась". Подняли до 1000, чтобы история была стабильнее.
+TRACKER_LIMIT = 1000
+
+# Сколько дней хранить окна публикации (windows) — ключ никогда не
+# обрезался и рос бесконечно (уже 212 записей на живых данных).
+WINDOWS_RETENTION_DAYS = 14
 
 
 def load_config():
@@ -51,17 +65,108 @@ def load_tracker(cfg):
         try:
             with open(tracker_path) as f:
                 return json.load(f), tracker_path
-        except json.JSONDecodeError:
-            log.warning("Tracker file corrupted, starting fresh")
+        except json.JSONDecodeError as e:
+            # БЛОКЕР (было): при битом JSON функция возвращала ПУСТОЙ трекер,
+            # а следующее сохранение затирало им файл — пять месяцев истории
+            # дедупа исчезали молча, и бот начинал перепощивать старое.
+            # Теперь: сохраняем повреждённую копию рядом для разбора и
+            # падаем с ненулевым кодом — трогать существующий файл нельзя.
+            corrupt_path = tracker_path.with_name(tracker_path.name + ".corrupt")
+            try:
+                shutil.copy2(tracker_path, corrupt_path)
+                log.error(
+                    "Tracker file corrupted (%s). Saved a copy to %s. Refusing "
+                    "to continue with an empty tracker.", e, corrupt_path,
+                )
+            except OSError as copy_err:
+                log.error(
+                    "Tracker file corrupted (%s), and failed to save a copy (%s). "
+                    "Refusing to continue with an empty tracker.", e, copy_err,
+                )
+            sys.exit(1)
     return {"urls": [], "headlines": [], "posts": [], "windows": {}}, tracker_path
 
 
+def _posted_at_key(post):
+    """Ключ сортировки по времени публикации записи.
+    Если даты нет или её не удалось разобрать — считаем запись самой свежей
+    (безопасное поведение по умолчанию: лучше не потерять запись при
+    обрезке, чем ошибочно выбросить её как "старую")."""
+    posted_at = post.get("posted_at") if isinstance(post, dict) else None
+    if posted_at:
+        try:
+            dt = datetime.fromisoformat(posted_at)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt
+        except (ValueError, TypeError):
+            pass
+    return datetime.max.replace(tzinfo=timezone.utc)
+
+
+def _trim_windows(tracker, days=WINDOWS_RETENTION_DAYS):
+    """windows раньше не обрезался никогда и рос вечно. Оставляем только
+    окна за последние N дней (значение — ISO-timestamp последнего поста
+    в это окно)."""
+    windows = tracker.get("windows")
+    if not isinstance(windows, dict) or not windows:
+        return
+    now = datetime.now(timezone.utc)
+    cutoff = now - timedelta(days=days)
+    kept = {}
+    for key, value in windows.items():
+        try:
+            dt = datetime.fromisoformat(value)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+        except (ValueError, TypeError):
+            # Не смогли разобрать дату — оставляем окно, чтобы не потерять
+            # данные из-за неожиданного формата.
+            kept[key] = value
+            continue
+        if dt >= cutoff:
+            kept[key] = value
+    tracker["windows"] = kept
+
+
 def save_tracker(tracker, tracker_path):
+    posts = tracker.get("posts", [])
+    if posts:
+        # ВАЖНО (было): обрезка list[-LIMIT:] предполагает хронологический
+        # порядок, которого нет — ридер добавляет сообщения от новых к
+        # старым (на живых данных 73 из 199 соседних пар в posts идут не по
+        # времени). Наивная обрезка выбрасывала не самые старые записи.
+        # Сортируем posts по posted_at и синхронно переставляем
+        # urls/headlines/fingerprints — они пополняются в том же порядке,
+        # что и posts, поэтому синхронизируем их по позиции.
+        n = len(posts)
+        paired_keys = ["urls", "headlines", "fingerprints"]
+        syncable = [k for k in paired_keys if len(tracker.get(k, [])) == n]
+        order = sorted(range(n), key=lambda i: _posted_at_key(posts[i]))
+        tracker["posts"] = [posts[i] for i in order]
+        for key in syncable:
+            values = tracker[key]
+            tracker[key] = [values[i] for i in order]
+        # Если длина списка разошлась с posts (не должно происходить в
+        # норме) — синхронизировать нечем, обрезаем по-старому как запасной
+        # безопасный путь, чтобы не уронить сохранение.
+        for key in paired_keys:
+            if key not in syncable and key in tracker:
+                tracker[key] = tracker[key][-TRACKER_LIMIT:]
+
     for key in ["urls", "headlines", "posts", "fingerprints"]:
         if key in tracker:
-            tracker[key] = tracker[key][-200:]
-    with open(tracker_path, "w") as f:
+            tracker[key] = tracker[key][-TRACKER_LIMIT:]
+
+    _trim_windows(tracker)
+
+    # БЛОКЕР (было): файл открывался на запись (усекался), и только потом
+    # писался JSON — сбой посреди записи оставлял битый файл. Пишем во
+    # временный файл рядом и атомарно заменяем через os.replace.
+    tmp_path = tracker_path.with_name(tracker_path.name + ".tmp")
+    with open(tmp_path, "w") as f:
         json.dump(tracker, f, ensure_ascii=False, indent=2)
+    os.replace(tmp_path, tracker_path)
     log.info("Tracker saved: %s", tracker_path)
 
 
@@ -104,17 +209,45 @@ async def read_news_thread(cfg):
         reader["api_hash"],
     )
 
+    messages = []
+    thread_id = cfg["telegram"]["news_thread_id"]
+
     try:
-        await client.start()
+        try:
+            await client.connect()
+        except Exception as e:
+            # Подключение обёрнуто в try/except: раньше здесь уже случались
+            # трейсбеки ConnectionError, которые роняли процесс без внятного
+            # выхода.
+            log.error("Failed to connect Telethon client: %s", e)
+            sys.exit(1)
+
+        if not await client.is_user_authorized():
+            # БЛОКЕР (было): client.start() без аргументов при протухшей
+            # сессии уходит в input() за номером телефона. Скрипт работает
+            # по cron — процесс повиснет навсегда, удерживая файл сессии.
+            # Никогда не запрашиваем ввод: логируем и выходим с ошибкой.
+            log.error(
+                "Telethon session is not authorized. Run interactive login "
+                "manually first (this script must never prompt for a "
+                "phone/code — it runs unattended from cron)."
+            )
+            sys.exit(1)
+
         log.info("Telethon client connected")
 
         chat_id = int(cfg["telegram"]["chat_id"])
-        thread_id = cfg["telegram"]["news_thread_id"]
 
         entity = await client.get_entity(chat_id)
-        log.info("Chat: %s", entity.title)
+        # МЕЛОЧЬ (было): entity.title даёт AttributeError, если сущность
+        # окажется не чатом (например, User). Безопасное получение атрибута.
+        chat_name = (
+            getattr(entity, "title", None)
+            or getattr(entity, "username", None)
+            or str(chat_id)
+        )
+        log.info("Chat: %s", chat_name)
 
-        messages = []
         try:
             async for msg in client.iter_messages(
                 entity,
@@ -129,9 +262,17 @@ async def read_news_thread(cfg):
                         "text": text,
                     })
         except FloodWaitError as e:
-            log.warning("Telegram flood wait: sleeping %d seconds", e.seconds)
-            await asyncio.sleep(e.seconds + 1)
-            log.info("Returning %d messages collected before flood wait", len(messages))
+            # ВАЖНО (было): sleep(e.seconds + 1), после чего функция всё
+            # равно выходила без повтора — сон был бессмысленным, а
+            # Telegram может попросить подождать порядка суток, из-за чего
+            # процесс залипал. Не спим, логируем величину задержки и
+            # выходим.
+            log.error(
+                "Telegram flood wait: %d seconds required — aborting "
+                "without sleeping (this is a cron job; sleeping could hang "
+                "it for hours)", e.seconds,
+            )
+            sys.exit(1)
         except Exception as e:
             log.error("Error reading messages: %s", e)
 
