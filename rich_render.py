@@ -28,6 +28,11 @@ QUOTE_MARKERS = ("🌴 Для экспатов", "💡 На заметку")
 SOURCE_MARKER = "📰 Источник"
 
 URL_RE = re.compile(r"https?://\S+")
+# Пунктуация, которая на практике относится к окружающему предложению, а не
+# к самому URL: точка, запятая, точка с запятой, закрывающая кавычка-ёлочка.
+# Закрывающую ")" в это множество не включаем — она обрабатывается отдельно
+# в _trim_url, потому что бывает частью самого URL (Foo_(disambiguation)).
+_URL_TRAILING_PUNCT = ".,;»"
 # Строка-подпись секции: короткая, заканчивается двоеточием
 LABEL_RE = re.compile(r"^(?P<label>.{1,60}:)\s*$")
 # Эмодзи в начале строки — маркер заголовка независимо от регистра
@@ -49,11 +54,30 @@ def _esc(text: str) -> str:
     return html.escape(text, quote=False)
 
 
+def _trim_url(url: str) -> str:
+    """Обрезает от конца URL пунктуацию окружающего предложения (см. _inline
+    про то, почему обрезаем именно сырой текст).
+
+    Закрывающую ")" обрезаем, только если она не закрывает открывающую скобку,
+    входящую в сам URL (например .../wiki/Foo_(disambiguation)) — иначе от
+    ссылки вида "(https://x.y/a_(b))" откусывался бы кусок самого URL, а не
+    только внешняя скобка предложения.
+    """
+    while True:
+        prev = url
+        while url and url[-1] in _URL_TRAILING_PUNCT:
+            url = url[:-1]
+        if url.endswith(")") and url.count("(") < url.count(")"):
+            url = url[:-1]
+        if url == prev:
+            return url
+
+
 def _inline(text: str) -> str:
     """Экранирует текст и оборачивает голые URL в <a>.
 
-    Порядок принципиален: URL ищем и обрезаем от хвостовой пунктуации
-    (".,;)") в СЫРОМ тексте, а не в уже экранированном — иначе rstrip
+    Порядок принципиален: URL ищем и обрезаем от хвостовой пунктуации (см.
+    _trim_url) в СЫРОМ тексте, а не в уже экранированном — иначе обрезка
     откусывает символ у готовой HTML-сущности (например ";" у "&amp;"
     вместо ";" у исходного "&"), и URL с UTM-хвостом вида "...?a=1&"
     разваливается: href="...&amp" и лишняя ";" в видимом тексте.
@@ -69,7 +93,7 @@ def _inline(text: str) -> str:
     last = 0
     for m in URL_RE.finditer(text):
         out.append(_esc(text[last:m.start()]))
-        url = m.group(0).rstrip(".,;)")
+        url = _trim_url(m.group(0))
         tail = m.group(0)[len(url):]
         href = html.escape(url, quote=True)
         out.append(f'<a href="{href}">{_esc(url)}</a>')
@@ -154,6 +178,7 @@ def plain_to_rich_html(text: str, *, heading_size: int = 3) -> str | None:
     строку) — пустое тело гарантированно даёт 400 при отправке в Telegram,
     поэтому вызывающий ОБЯЗАН проверить результат на None перед отправкой.
     """
+    text = text or ""
     blocks = [b for b in re.split(r"\n\s*\n", text.strip()) if b.strip()]
     if not blocks:
         return None
@@ -185,10 +210,11 @@ def plain_to_rich_html(text: str, *, heading_size: int = 3) -> str | None:
 
 def extract_source_url(text: str) -> str | None:
     """URL из строки «📰 Источник: …» — для link_preview_options.url."""
+    text = text or ""
     for line in text.split("\n"):
         if line.lstrip().startswith(SOURCE_MARKER):
             m = URL_RE.search(line)
             if m:
-                return m.group(0).rstrip(".,;)")
+                return _trim_url(m.group(0))
     m = URL_RE.search(text)
-    return m.group(0).rstrip(".,;)") if m else None
+    return _trim_url(m.group(0)) if m else None

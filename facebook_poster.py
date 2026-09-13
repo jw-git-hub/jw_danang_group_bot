@@ -31,14 +31,14 @@ def send_facebook_post(cfg, text):
     ни при каких обстоятельствах.
     """
     try:
-        fb = cfg.get("facebook")
-        # Явный выключатель: секцию с учётными данными оставляем в конфиге, чтобы
-        # включить одним флагом, когда токен страницы будет перевыпущен.
-        if fb and fb.get("enabled") is False:
-            log.info("Facebook отключён в конфиге (enabled=false) — пропускаем")
-            return None
-        if not fb:
-            log.warning("Facebook config missing — skipping FB post")
+        fb = cfg.get("facebook", {})
+        # Явный переключатель "включено": по умолчанию (секция отсутствует,
+        # пуста, не словарь, enabled отсутствует/не булево True) — выключено.
+        # Раньше отключал только явный enabled=False, а отсутствующий ключ
+        # считался "включено" — из-за этого с мёртвым токеном (с 7 мая) бот
+        # 107 дней подряд слал запросы на FB, которые заведомо не пройдут.
+        if not isinstance(fb, dict) or fb.get("enabled") is not True:
+            log.info("Facebook отключён в конфиге (facebook.enabled не true) — пропускаем")
             return None
 
         # Секция может присутствовать, но быть неполной (например, только
