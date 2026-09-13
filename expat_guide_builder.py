@@ -25,8 +25,10 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import subprocess
 import sys
+import tempfile
 from typing import Optional
 
 from news_bot import clean_ai_output
@@ -89,6 +91,36 @@ logging.basicConfig(
 log = logging.getLogger("expat_guide_builder")
 
 
+# ---- Мета-комментарии модели ------------------------------------------------
+# Продублировано в expat_guide_bot.py и guide_verify_apply.py: гонять единый
+# импорт между этими тремя модулями смысла нет (в guide_verify_apply.py его бы
+# вообще неоткуда было взять дёшево — только через этот файл, который тянет
+# news_bot.py со всеми его зависимостями), а сама функция маленькая и
+# самодостаточная. См. память проекта: AI-мета-комментарии не должны попадать
+# в то, что видит читатель.
+_META_LINE_START_RE = re.compile(
+    r"^\W*(Вот|Конечно|Если нужно|Могу|Надеюсь|Here is|Sure)\b", re.MULTILINE,
+)
+_META_ANYWHERE_RE = re.compile(
+    r"требует проверки|\(уточнить\)|для редактора|источник не найден|\bTODO\b|"
+    r"```|\bJSON\b|языковая модель|as an ai",
+    re.IGNORECASE,
+)
+
+
+def meta_violations(text: str) -> list[str]:
+    """Возвращает список найденных следов AI-мета-комментариев/незавершённой правки
+    в тексте (пусто — текст чист)."""
+    if not text:
+        return []
+    violations = []
+    for m in _META_LINE_START_RE.finditer(text):
+        violations.append(f"преамбула в начале строки: {m.group(0)!r}")
+    for m in _META_ANYWHERE_RE.finditer(text):
+        violations.append(f"мета-паттерн: {m.group(0)!r}")
+    return violations
+
+
 # ---- Парсинг аргументов ----------------------------------------------------
 
 def parse_args(argv: list[str]) -> tuple[list[int], bool, bool]:
@@ -120,7 +152,10 @@ def parse_args(argv: list[str]) -> tuple[list[int], bool, bool]:
             print(__doc__)
             raise SystemExit(0)
         else:
-            raise SystemExit(f"Ошибка: неизвестный аргумент: {arg}")
+            # exit(2), а не raise SystemExit(str) (даёт exit 1) — неизвестный
+            # аргумент это ошибка использования CLI, а не сбой выполнения.
+            print(f"Ошибка: неизвестный аргумент: {arg}", file=sys.stderr)
+            sys.exit(2)
 
     if not ids:
         raise SystemExit("Ошибка: укажите --id N (или --id N-M)")
@@ -174,13 +209,22 @@ def build_prompt(title: str, block: str) -> str:
 
 
 def call_claude(prompt: str) -> Optional[str]:
-    """Вызывает `claude -p prompt`, возвращает stdout или None при ошибке."""
+    """Вызывает `claude -p prompt`, возвращает stdout или None при ошибке.
+
+    --strict-mcp-config --tools "" — генерация текста материала не должна иметь
+    доступа ни к каким MCP-серверам или инструментам из окружения, в котором
+    запущен builder; ничего позиционного после `--tools ""` быть не должно.
+    cwd — временный каталог: рабочая директория проекта (с config.json и
+    остальными секретами) этому вызову не нужна и не должна быть виден claude.
+    """
     try:
         result = subprocess.run(
-            ["claude", "-p", prompt],
+            ["claude", "-p", prompt, "--strict-mcp-config", "--tools", ""],
             capture_output=True,
             text=True,
             timeout=CLAUDE_TIMEOUT_SEC,
+            cwd=tempfile.gettempdir(),
+            stdin=subprocess.DEVNULL,
         )
     except FileNotFoundError:
         log.error("CLI `claude` не найден в PATH. Установите Claude Code CLI.")
@@ -190,9 +234,12 @@ def call_claude(prompt: str) -> Optional[str]:
         return None
 
     if result.returncode != 0:
+        # Диагностика (например, "usage limit reached") иногда приходит только на
+        # stdout — если логировать один stderr, такая ошибка выглядит немой.
         log.error(
-            "Claude CLI вернул код %d. stderr: %s",
+            "Claude CLI вернул код %d. stdout: %s stderr: %s",
             result.returncode,
+            (result.stdout or "")[:500],
             (result.stderr or "")[:500],
         )
         return None
@@ -211,6 +258,9 @@ def validate_body(body: str) -> Optional[str]:
     for ch in FORBIDDEN_MARKDOWN:
         if ch in body:
             return f"найден запрещённый markdown-символ '{ch}'"
+    violations = meta_violations(body)
+    if violations:
+        return f"обнаружены следы мета-комментариев ({violations[0]})"
     return None
 
 
@@ -252,12 +302,15 @@ def generate_body(title: str, block: str) -> Optional[str]:
 
 # ---- Обработка одного id ---------------------------------------------------
 
-def process_id(data: list[dict], target_id: int, preview: bool, force: bool) -> bool:
-    """Обрабатывает один id. Возвращает True если data изменена."""
+def process_id(data: list[dict], target_id: int, preview: bool, force: bool) -> tuple[bool, bool]:
+    """Обрабатывает один id. Возвращает (changed, failed):
+      changed — data изменена (нужно сохранить);
+      failed  — id не найден или генерация не удалась (main() должен вернуть код 1).
+    Пропуск по "body уже заполнен" и preview — это НЕ failed: всё отработало штатно."""
     idx = find_entry_index(data, target_id)
     if idx is None:
         log.error("ID=%d не найден в %s", target_id, GUIDE_PATH)
-        return False
+        return False, True
 
     entry = data[idx]
     title = entry.get("title", "")
@@ -267,23 +320,34 @@ def process_id(data: list[dict], target_id: int, preview: bool, force: bool) -> 
     if existing.strip() and not force and not preview:
         log.info("ID=%d: body уже заполнен (%d chars), пропуск (используйте --force)",
                  target_id, len(existing))
-        return False
+        return False, False
 
     body = generate_body(title, block)
     if body is None:
         log.warning("ID=%d: не удалось сгенерировать body", target_id)
-        return False
+        return False, True
 
     if preview:
         print("=" * 60)
         print(body)
         print("=" * 60)
         log.info("ID=%d: preview, не сохраняем (length=%d chars)", target_id, len(body))
-        return False
+        return False, False
 
     data[idx]["body"] = body
+    if existing.strip():
+        # Форсированная перегенерация меняет текст материала — старые sources/
+        # verified_at подтверждали ПРЕЖНЮЮ формулировку и не обязаны быть верны для
+        # новой. Правильнее считать материал непроверенным и прогнать через
+        # guide_verify_apply.py заново, чем оставить читателю чужой фактчек под
+        # новым текстом.
+        data[idx].pop("sources", None)
+        data[idx].pop("verified_at", None)
+        data[idx].pop("verification_confidence", None)
+        log.info("ID=%d: старые sources/verified_at/verification_confidence сброшены (перегенерация)",
+                 target_id)
     log.info("ID=%d body заполнен (length=%d chars)", target_id, len(body))
-    return True
+    return True, False
 
 
 # ---- Точка входа -----------------------------------------------------------
@@ -294,22 +358,31 @@ def main(argv: list[str]) -> int:
 
     data = load_guide()
     changed = False
+    failed = False
     for target_id in ids:
         try:
-            if process_id(data, target_id, preview=preview, force=force):
-                changed = True
-                # Сохраняем сразу: длинный прогон по диапазону не должен терять
-                # уже сгенерированные материалы из-за сбоя на середине.
-                if not preview:
-                    save_guide_atomic(data)
-                    log.info("ID=%d сохранён в %s", target_id, GUIDE_PATH)
+            item_changed, item_failed = process_id(data, target_id, preview=preview, force=force)
         except Exception as exc:  # noqa: BLE001
             log.exception("ID=%d: непредвиденная ошибка: %s", target_id, exc)
+            failed = True
+            continue
+        if item_changed:
+            changed = True
+            # Сохраняем сразу: длинный прогон по диапазону не должен терять
+            # уже сгенерированные материалы из-за сбоя на середине.
+            if not preview:
+                save_guide_atomic(data)
+                log.info("ID=%d сохранён в %s", target_id, GUIDE_PATH)
+        if item_failed:
+            failed = True
 
     if not changed:
         log.info("Изменений нет — файл не сохраняем")
 
-    return 0
+    # Раньше main() всегда возвращал 0 — неудача одного id (не найден, генерация не
+    # удалась после всех попыток) тонула среди ERROR/WARNING в логе, а вызывающий
+    # (cron/скрипт-обёртка над диапазоном) считал прогон успешным.
+    return 1 if failed else 0
 
 
 if __name__ == "__main__":
