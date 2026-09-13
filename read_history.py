@@ -15,17 +15,23 @@ Usage: python3 read_history.py
 import asyncio
 import json
 import logging
-import os
 import re
-import shutil
 import sys
-from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from telethon import TelegramClient
 from telethon.errors import FloodWaitError
 
+# load_tracker/save_tracker — единая реализация в dedup.py (см. её докстринг):
+# было по одной несовместимой копии на каждый скрипт (лимит хранения раньше
+# был здесь равен окну чтения ридера — 200 сообщений, — что означало, что
+# каждый новый пост вытеснял запись, которую ридер тут же переимпортировал).
+# Тонкие обёртки ниже сохраняют прежние сигнатуры (tracker, tracker_path).
 from dedup import extract_fingerprint
+from dedup import load_tracker as _dedup_load_tracker
+from dedup import save_tracker as _dedup_save_tracker
+from dedup import acquire_lock, tracker_lock_path as _dedup_lock_path
+from dedup import _posted_at_key  # noqa: F401 — используется в h6_reader_merge.py как RH._posted_at_key
 
 logging.basicConfig(
     level=logging.INFO,
@@ -35,16 +41,6 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 BASE_DIR = Path(__file__).parent
-
-# Лимит хранения записей трекера. Раньше был равен окну чтения ридера (200
-# сообщений) — это значит, что каждый новый пост вытеснял запись, которую
-# ридер потом заново импортировал при следующем прогоне, и память дедупа
-# непрерывно "тасовалась". Подняли до 1000, чтобы история была стабильнее.
-TRACKER_LIMIT = 1000
-
-# Сколько дней хранить окна публикации (windows) — ключ никогда не
-# обрезался и рос бесконечно (уже 212 записей на живых данных).
-WINDOWS_RETENTION_DAYS = 14
 
 
 def load_config():
@@ -60,128 +56,37 @@ def load_config():
 
 
 def load_tracker(cfg):
+    """read_history.py — инструмент ВОССТАНОВЛЕНИЯ трекера: в отличие от
+    news_bot.py (см. C2), отсутствие файла здесь не ошибка, а нормальный
+    сценарий первого запуска на новом сервере — просто начинаем с пустого
+    трекера и наполняем его из истории треда."""
     tracker_path = BASE_DIR / cfg["news"]["tracker_file"]
-    if tracker_path.exists():
-        try:
-            with open(tracker_path) as f:
-                return json.load(f), tracker_path
-        except json.JSONDecodeError as e:
-            # БЛОКЕР (было): при битом JSON функция возвращала ПУСТОЙ трекер,
-            # а следующее сохранение затирало им файл — пять месяцев истории
-            # дедупа исчезали молча, и бот начинал перепощивать старое.
-            # Теперь: сохраняем повреждённую копию рядом для разбора и
-            # падаем с ненулевым кодом — трогать существующий файл нельзя.
-            corrupt_path = tracker_path.with_name(tracker_path.name + ".corrupt")
-            try:
-                shutil.copy2(tracker_path, corrupt_path)
-                log.error(
-                    "Tracker file corrupted (%s). Saved a copy to %s. Refusing "
-                    "to continue with an empty tracker.", e, corrupt_path,
-                )
-            except OSError as copy_err:
-                log.error(
-                    "Tracker file corrupted (%s), and failed to save a copy (%s). "
-                    "Refusing to continue with an empty tracker.", e, copy_err,
-                )
-            sys.exit(1)
-    return {"urls": [], "headlines": [], "posts": [], "windows": {}}, tracker_path
-
-
-def _posted_at_key(post):
-    """Ключ сортировки по времени публикации записи.
-    Если даты нет или её не удалось разобрать — считаем запись самой свежей
-    (безопасное поведение по умолчанию: лучше не потерять запись при
-    обрезке, чем ошибочно выбросить её как "старую")."""
-    posted_at = post.get("posted_at") if isinstance(post, dict) else None
-    if posted_at:
-        try:
-            dt = datetime.fromisoformat(posted_at)
-            if dt.tzinfo is None:
-                dt = dt.replace(tzinfo=timezone.utc)
-            return dt
-        except (ValueError, TypeError):
-            pass
-    return datetime.max.replace(tzinfo=timezone.utc)
-
-
-def _trim_windows(tracker, days=WINDOWS_RETENTION_DAYS):
-    """windows раньше не обрезался никогда и рос вечно. Оставляем только
-    окна за последние N дней (значение — ISO-timestamp последнего поста
-    в это окно)."""
-    windows = tracker.get("windows")
-    if not isinstance(windows, dict) or not windows:
-        return
-    now = datetime.now(timezone.utc)
-    cutoff = now - timedelta(days=days)
-    kept = {}
-    for key, value in windows.items():
-        try:
-            dt = datetime.fromisoformat(value)
-            if dt.tzinfo is None:
-                dt = dt.replace(tzinfo=timezone.utc)
-        except (ValueError, TypeError):
-            # Не смогли разобрать дату — оставляем окно, чтобы не потерять
-            # данные из-за неожиданного формата.
-            kept[key] = value
-            continue
-        if dt >= cutoff:
-            kept[key] = value
-    tracker["windows"] = kept
+    return _dedup_load_tracker(tracker_path), tracker_path
 
 
 def save_tracker(tracker, tracker_path):
-    posts = tracker.get("posts", [])
-    if posts:
-        # ВАЖНО (было): обрезка list[-LIMIT:] предполагает хронологический
-        # порядок, которого нет — ридер добавляет сообщения от новых к
-        # старым (на живых данных 73 из 199 соседних пар в posts идут не по
-        # времени). Наивная обрезка выбрасывала не самые старые записи.
-        # Сортируем posts по posted_at и синхронно переставляем
-        # urls/headlines/fingerprints — они пополняются в том же порядке,
-        # что и posts, поэтому синхронизируем их по позиции.
-        n = len(posts)
-        paired_keys = ["urls", "headlines", "fingerprints"]
-        syncable = [k for k in paired_keys if len(tracker.get(k, [])) == n]
-        order = sorted(range(n), key=lambda i: _posted_at_key(posts[i]))
-        tracker["posts"] = [posts[i] for i in order]
-        for key in syncable:
-            values = tracker[key]
-            tracker[key] = [values[i] for i in order]
-        # Если длина списка разошлась с posts (не должно происходить в
-        # норме) — синхронизировать нечем, обрезаем по-старому как запасной
-        # безопасный путь, чтобы не уронить сохранение.
-        for key in paired_keys:
-            if key not in syncable and key in tracker:
-                tracker[key] = tracker[key][-TRACKER_LIMIT:]
-
-    for key in ["urls", "headlines", "posts", "fingerprints"]:
-        if key in tracker:
-            tracker[key] = tracker[key][-TRACKER_LIMIT:]
-
-    _trim_windows(tracker)
-
-    # БЛОКЕР (было): файл открывался на запись (усекался), и только потом
-    # писался JSON — сбой посреди записи оставлял битый файл. Пишем во
-    # временный файл рядом и атомарно заменяем через os.replace.
-    tmp_path = tracker_path.with_name(tracker_path.name + ".tmp")
-    with open(tmp_path, "w") as f:
-        json.dump(tracker, f, ensure_ascii=False, indent=2)
-    os.replace(tmp_path, tracker_path)
-    log.info("Tracker saved: %s", tracker_path)
+    _dedup_save_tracker(tracker_path, tracker)
 
 
 def extract_url_from_text(text):
-    """Extract source URL from post text (looks for 📰 Источник: URL pattern)."""
+    """Extract source URL from post text (looks for 📰 Источник: URL pattern).
+
+    Ожидает text = msg.message (см. read_news_thread) — сырой текст без
+    markdown-обёртки, но регулярка всё равно терпима к markdown-ссылке вида
+    "[URL](URL)" (необязательный "[" перед URL, ")"/"]" не входят в захват)
+    и хвостовой пунктуации из естественного текста ("...html." в конце
+    предложения).
+    """
     if not text:
         return None
-    # Pattern: 📰 Источник: URL
-    m = re.search(r"Источник:\s*(https?://\S+)", text)
+    # Pattern: 📰 Источник: URL, с необязательной markdown-ссылкой "[URL](URL)"
+    m = re.search(r"Источник:\s*\[?(https?://[^\s\])]+)", text)
     if m:
-        return m.group(1).rstrip(")")
+        return m.group(1).rstrip(".,;")
     # Fallback: any URL in text
-    m = re.search(r"https?://\S+", text)
+    m = re.search(r"https?://[^\s\])]+", text)
     if m:
-        url = m.group(0).rstrip(")")
+        url = m.group(0).rstrip(".,;")
         # Skip telegram URLs
         if "t.me" not in url and "telegram" not in url:
             return url
@@ -254,8 +159,11 @@ async def read_news_thread(cfg):
                 reply_to=thread_id,
                 limit=200,
             ):
-                if msg.text or msg.message:
-                    text = msg.text or msg.message
+                if msg.message or msg.text:
+                    # msg.message — сырой текст без markdown-обёртки; msg.text
+                    # (форматированный markdown) оборачивает ссылки в
+                    # "[URL](URL)" и ломал бы regex-извлечение URL ниже.
+                    text = msg.message or msg.text
                     messages.append({
                         "id": msg.id,
                         "date": msg.date.isoformat(),
@@ -338,8 +246,26 @@ def populate_tracker(messages, tracker):
     return added
 
 
+def check_argv():
+    """read_history.py не принимает аргументов — неожиданный флаг (опечатка
+    в ручном запуске) лучше провалить явно и сразу, чем молча проигнорировать."""
+    if len(sys.argv) > 1:
+        print(f"Usage: {sys.argv[0]}\nUnknown argument(s): {' '.join(sys.argv[1:])}",
+              file=sys.stderr)
+        sys.exit(2)
+
+
 async def main():
+    check_argv()
     cfg = load_config()
+
+    # news_bot.py и read_history.py читают/пишут один и тот же tracker_file —
+    # без общего лока конкурентный запуск (например, ручной read_history.py
+    # поверх ещё не завершившегося cron-прогона news_bot.py) мог бы потерять
+    # запись при сохранении или задвоить публикацию.
+    tracker_path = BASE_DIR / cfg["news"]["tracker_file"]
+    _lock_fh = acquire_lock(_dedup_lock_path(tracker_path))  # noqa: F841 — держим ссылку, чтобы лок не снялся раньше времени
+
     tracker, tracker_path = load_tracker(cfg)
 
     log.info("=== Reading news thread history ===")

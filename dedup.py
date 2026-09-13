@@ -5,9 +5,15 @@ L2: Jaccard/Containment по английским заголовкам
 L3: Entity fingerprint (работает кросс-язычно: RU↔EN)
 """
 
+import fcntl
+import json
 import logging
+import os
 import re
+import shutil
+import sys
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from urllib.parse import urlparse
 
 log = logging.getLogger(__name__)
@@ -34,6 +40,13 @@ _FINGERPRINT_STOPWORDS = frozenset({
     'diem', 'nghen', 'tang', 'thao', 'toc', 'hanh', 'tai', 'tam',
     'trung', 'van', 'chi', 'minh', 'city', 'travel',
     'hanoi', 'thanh', 'hoi', 'tra',
+    # Суффикс издания в заголовке (" - Tuoi Tre News | The News Gateway to
+    # Vietnam", " - vietnamnews.vn"...) обрезается _strip_publisher_suffix,
+    # но старые записи трекера считались ДО того, как это стало происходить —
+    # вычитаем эти слова и при сравнении (см. is_duplicate), чтобы не ловить
+    # ложные совпадения только по общему изданию у двух разных статей.
+    'tuoi', 'tre', 'gateway', 'vnexpress', 'international', 'dtinews',
+    'vietnamnews', 'nhandan', 'vietnamplus',
 })
 
 # Стоп-слова для L2 (сравнение заголовков). Отдельный набор от fingerprint-
@@ -189,6 +202,10 @@ def is_duplicate(url, headline, tracker, threshold=0.35):
         w for w in _tokenize(_strip_publisher_suffix(headline))
         if w not in _L2_STOPWORDS)
     for post in posts:
+        if not isinstance(post, dict):
+            # Легаси/повреждённая запись (например, строка вместо объекта) —
+            # .get() ниже уронил бы AttributeError и оставил статью неотфильтрованной.
+            continue
         if not _is_recent(post):
             # Ограничиваем L2 недавней историей — старые совпадения почти
             # всегда ложные, а настоящий повтор ловится через L1 по URL.
@@ -211,8 +228,10 @@ def is_duplicate(url, headline, tracker, threshold=0.35):
                          j, c, headline[:50], en_title[:50])
                 return True
 
-    # L3: Entity fingerprint (cross-language)
-    incoming_fp = extract_fingerprint(headline, url)
+    # L3: Entity fingerprint (cross-language). Заголовок чистим от суффикса
+    # издания — как и при сохранении отпечатка в трекер (см. news_bot.py) —
+    # иначе " - Tuoi Tre News | ..." сам по себе даёт часть совпадения.
+    incoming_fp = extract_fingerprint(_strip_publisher_suffix(headline), url)
     if incoming_fp:
         fingerprints = tracker.get("fingerprints", [])
         # Check pre-computed fingerprints (индекс fingerprints[i] соответствует
@@ -221,7 +240,11 @@ def is_duplicate(url, headline, tracker, threshold=0.35):
             post = posts[i] if i < len(posts) else None
             if not _is_recent(post):
                 continue
-            stored_fp = set(stored_fp_list)
+            # Старые записи трекера считались ДО того, как суффикс издания
+            # стал обрезаться и слова издания попали в стоп-лист — вычитаем
+            # текущий стоп-лист из уже сохранённого отпечатка на лету, не
+            # переписывая сам файл трекера.
+            stored_fp = set(stored_fp_list) - _FINGERPRINT_STOPWORDS
             if fingerprint_match(incoming_fp, stored_fp):
                 log.info("Duplicate (L3 fingerprint): %d shared tokens, '%s'",
                          len(incoming_fp & stored_fp), headline[:50])
@@ -230,10 +253,12 @@ def is_duplicate(url, headline, tracker, threshold=0.35):
         # Backward compat: compute from posts without fingerprints field
         if not fingerprints:
             for post in posts:
+                if not isinstance(post, dict):
+                    continue
                 if not _is_recent(post):
                     continue
                 stored_fp = extract_fingerprint(
-                    post.get("headline", ""), post.get("url")
+                    _strip_publisher_suffix(post.get("headline", "")), post.get("url")
                 )
                 if fingerprint_match(incoming_fp, stored_fp):
                     log.info("Duplicate (L3 fingerprint from post): '%s'",
@@ -241,3 +266,192 @@ def is_duplicate(url, headline, tracker, threshold=0.35):
                     return True
 
     return False
+
+
+# ---------------------------------------------------------------------------
+# Tracker I/O — единая реализация для news_bot.py и read_history.py.
+#
+# Раньше у каждого скрипта было своё load/save: news_bot.py писал не атомарно
+# (усечение файла на открытии + запись поверх — сбой посреди записи оставлял
+# битый файл) и на битом JSON молча "начинал с чистого листа", затирая при
+# следующем сохранении всю историю дедупа; read_history.py уже делал это
+# правильно (temp-файл + os.replace, отказ на битом файле вместо тихого
+# сброса). Это реализация read_history, вынесенная сюда как единственная,
+# плюс общий лимит хранения (было 200 у news_bot.py, слишком мало — новый
+# пост вытеснял запись, которую тот же ридер тут же переимпортировал).
+# ---------------------------------------------------------------------------
+TRACKER_LIMIT = 1000
+
+# Сколько дней хранить окна публикации (windows) — ключ раньше не обрезался
+# никогда и рос бесконечно.
+WINDOWS_RETENTION_DAYS = 14
+
+
+def _posted_at_key(post):
+    """Ключ сортировки по времени публикации записи.
+    Если даты нет, она не разбирается или запись не dict — считаем запись
+    самой свежей (безопасное поведение по умолчанию: лучше не потерять запись
+    при обрезке, чем ошибочно выбросить её как "старую")."""
+    posted_at = post.get("posted_at") if isinstance(post, dict) else None
+    if posted_at:
+        try:
+            dt = datetime.fromisoformat(posted_at)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt
+        except (ValueError, TypeError):
+            pass
+    return datetime.max.replace(tzinfo=timezone.utc)
+
+
+def _trim_windows(tracker, days=WINDOWS_RETENTION_DAYS):
+    """windows раньше не обрезался никогда и рос вечно. Оставляем только
+    окна за последние N дней (значение — ISO-timestamp последнего поста
+    в это окно)."""
+    windows = tracker.get("windows")
+    if not isinstance(windows, dict) or not windows:
+        return
+    now = datetime.now(timezone.utc)
+    cutoff = now - timedelta(days=days)
+    kept = {}
+    for key, value in windows.items():
+        try:
+            dt = datetime.fromisoformat(value)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+        except (ValueError, TypeError):
+            # Не смогли разобрать дату — оставляем окно, чтобы не потерять
+            # данные из-за неожиданного формата.
+            kept[key] = value
+            continue
+        if dt >= cutoff:
+            kept[key] = value
+    tracker["windows"] = kept
+
+
+def _save_corrupt_copy(path, reason):
+    ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    corrupt_path = path.with_name(f"{path.name}.corrupt-{ts}")
+    try:
+        shutil.copy2(path, corrupt_path)
+        log.error(
+            "Tracker file corrupted (%s). Saved a copy to %s. Refusing to "
+            "continue with an empty tracker.", reason, corrupt_path,
+        )
+    except OSError as copy_err:
+        log.error(
+            "Tracker file corrupted (%s), and failed to save a copy (%s). "
+            "Refusing to continue with an empty tracker.", reason, copy_err,
+        )
+
+
+def load_tracker(path):
+    """Загружает трекер дедупликации. path может быть str или Path.
+
+    Битый (не-JSON или не JSON-объект верхнего уровня) файл НЕ приводит к
+    тихому старту с пустого места — это стирало бы историю дедупа при
+    следующем сохранении. Вместо этого сохраняем повреждённую копию рядом и
+    падаем с ненулевым кодом (см. C2 про --init для намеренного пустого старта).
+    """
+    path = Path(path)
+    if not path.exists():
+        return {"urls": [], "headlines": [], "posts": [], "windows": {}}
+
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+    except json.JSONDecodeError as e:
+        _save_corrupt_copy(path, str(e))
+        sys.exit(1)
+
+    if not isinstance(data, dict):
+        _save_corrupt_copy(path, "не JSON-объект верхнего уровня")
+        sys.exit(1)
+
+    posts = data.get("posts")
+    if isinstance(posts, list) and any(not isinstance(p, dict) for p in posts):
+        # Пропускаем не-dict записи posts (легаси/повреждённые), синхронно
+        # выбрасывая те же позиции из парных массивов, если их длина совпадает
+        # с posts — иначе фикспринты/urls/headlines разъедутся по индексу.
+        n = len(posts)
+        keep_idx = [i for i, p in enumerate(posts) if isinstance(p, dict)]
+        skipped = n - len(keep_idx)
+        data["posts"] = [posts[i] for i in keep_idx]
+        for key in ("urls", "headlines", "fingerprints"):
+            values = data.get(key)
+            if isinstance(values, list) and len(values) == n:
+                data[key] = [values[i] for i in keep_idx]
+        log.warning("Пропущено %d повреждённых (не-объект) записей posts при загрузке трекера %s",
+                    skipped, path)
+
+    return data
+
+
+def save_tracker(path, tracker):
+    """Сохраняет трекер дедупликации. path может быть str или Path.
+
+    - Хронологическая сортировка posts с синхронной перестановкой
+      urls/headlines/fingerprints (ридер добавляет сообщения от новых к
+      старым — наивная обрезка "последние N" без сортировки выбрасывала не
+      самые старые записи).
+    - Лимит TRACKER_LIMIT записей (см. модульный докстринг).
+    - Атомарная запись: временный файл + flush + fsync + os.replace — сбой
+      посреди записи (диск переполнен и т.п.) не портит существующий файл.
+    """
+    path = Path(path)
+    posts = tracker.get("posts", [])
+    if posts:
+        n = len(posts)
+        paired_keys = ["urls", "headlines", "fingerprints"]
+        syncable = [k for k in paired_keys if len(tracker.get(k, [])) == n]
+        order = sorted(range(n), key=lambda i: _posted_at_key(posts[i]))
+        tracker["posts"] = [posts[i] for i in order]
+        for key in syncable:
+            values = tracker[key]
+            tracker[key] = [values[i] for i in order]
+        # Если длина списка разошлась с posts (не должно происходить в
+        # норме) — синхронизировать нечем, обрезаем по-старому как запасной
+        # безопасный путь, чтобы не уронить сохранение.
+        for key in paired_keys:
+            if key not in syncable and key in tracker:
+                tracker[key] = tracker[key][-TRACKER_LIMIT:]
+
+    for key in ["urls", "headlines", "posts", "fingerprints"]:
+        if key in tracker:
+            tracker[key] = tracker[key][-TRACKER_LIMIT:]
+
+    _trim_windows(tracker)
+
+    tmp_path = path.with_name(path.name + ".tmp")
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        json.dump(tracker, f, ensure_ascii=False, indent=2)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp_path, path)
+    log.info("Tracker saved: %s", path)
+
+
+def tracker_lock_path(tracker_path):
+    """Путь лок-файла, общего для news_bot.py и read_history.py: <tracker>.lock."""
+    return Path(tracker_path).with_name(Path(tracker_path).name + ".lock")
+
+
+def acquire_lock(lock_path):
+    """Неблокирующий файловый лок (см. expat_guide_bot.acquire_lock).
+
+    news_bot.py и read_history.py читают/пишут один и тот же tracker_file —
+    без общего лока вторая одновременно запущенная копия читала бы то же
+    состояние трекера и могла бы задвоить публикацию или потерять запись при
+    сохранении. Лок держится открытым до конца процесса — ОС снимает его
+    автоматически при завершении, даже при аварийном выходе.
+    """
+    lock_file = open(lock_path, "w")
+    try:
+        fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        log.info(
+            "Другой процесс (news_bot.py/read_history.py) уже выполняется "
+            "(занят lock-файл %s) — выходим с кодом 0", lock_path,
+        )
+        sys.exit(0)
+    return lock_file
