@@ -13,24 +13,36 @@
 для 12-го месяца (всего 365 уроков).
 
 Запуск:
-    python3 vietnamese_lesson_builder.py --month N [--preview] [--force] [--limit N]
+    python3 vietnamese_lesson_builder.py --month N [--preview] [--force] [--allow-published]
+                                          [--day N[,N...]] [--limit N]
 
-  --month N     обязателен, 1..12
-  --preview     не сохраняет JSON, печатает результат в stdout
-  --force       перезаписать существующие уроки месяца
-  --limit N     ограничить число генераций (для теста)
+  --month N            обязателен, 1..12
+  --preview            не сохраняет JSON, печатает результат в stdout
+  --force              перезаписать существующие уроки месяца (уже опубликованные
+                        дни — см. current_day в vietnamese_state.json — пропускаются,
+                        если не передан --allow-published)
+  --allow-published     вместе с --force перезаписать и уже опубликованные дни
+  --day N[,N...]        сгенерировать только перечисленные дни месяца
+  --limit N             ограничить число генераций (для теста)
+
+Параллельные запуски билдера (например, несколько месяцев одновременно) сериализуются
+через файловый лок vietnamese_lessons.json.lock — вторая копия сразу завершится с
+ошибкой, а не тихо потеряет уроки первой.
 """
 
 from __future__ import annotations
 
 import argparse
+import fcntl
 import json
 import logging
 import os
 import re
 import subprocess
 import sys
+import tempfile
 import time
+import unicodedata
 from pathlib import Path
 from typing import Optional
 
@@ -52,11 +64,22 @@ log = logging.getLogger("vn_lesson_builder")
 # ---------------------------------------------------------------------------
 BASE_DIR = Path(__file__).parent
 LESSONS_PATH = BASE_DIR / "vietnamese_lessons.json"
+LESSONS_LOCK_PATH = LESSONS_PATH.with_name(LESSONS_PATH.name + ".lock")
+STATE_PATH = BASE_DIR / "vietnamese_state.json"
 CACHE_DIR = BASE_DIR / "cache" / "wikibooks"
 CACHE_TTL_SECONDS = 7 * 24 * 3600  # 7 дней
 
 # Сколько раз переспросить Claude, если ответ не распарсился или урок невалиден
 MAX_ATTEMPTS = 3
+
+# После скольких подряд неудачных запусков `claude -p` (rc != 0) прерывать весь
+# запуск билдера — если исчерпан лимит аккаунта, месячный прогон иначе сделает
+# ещё ~90 обречённых вызовов подряд.
+MAX_CONSECUTIVE_RC_FAILURES = 3
+
+# Лимит длины отрендеренного поста в UTF-16 code units (так Telegram считает длину
+# сообщения; см. vietnamese_bot._utf16_len) — с запасом от TELEGRAM_MAX_LEN=4096.
+MAX_POST_UTF16_LEN = 3800
 
 # ---------------------------------------------------------------------------
 # Месячная структура курса
@@ -696,14 +719,26 @@ def _extract_json_object(text: str) -> Optional[str]:
     return None
 
 
+_consecutive_rc_failures = 0
+
+
 def call_claude(prompt: str, timeout: int = 240) -> Optional[dict]:
-    """Запускает claude -p и пытается распарсить JSON."""
+    """Запускает claude -p и пытается распарсить JSON. Возвращает dict, и ТОЛЬКО dict —
+    валидный, но не-объектный JSON (список, строка, число) считается неудачей, как и
+    отсутствие JSON вовсе.
+
+    --strict-mcp-config и --tools "" отключают MCP-серверы и все инструменты, а
+    cwd=tempfile.gettempdir() уводит запуск из каталога проекта — так проектный/глобальный
+    CLAUDE.md и allow-листы разрешений на этот вызов не действуют."""
+    global _consecutive_rc_failures
     try:
         result = subprocess.run(
-            ["claude", "-p", prompt],
+            ["claude", "-p", prompt, "--strict-mcp-config", "--tools", ""],
             capture_output=True,
             text=True,
             timeout=timeout,
+            cwd=tempfile.gettempdir(),
+            stdin=subprocess.DEVNULL,
         )
     except subprocess.TimeoutExpired:
         log.error("claude -p таймаут (%ds)", timeout)
@@ -716,8 +751,23 @@ def call_claude(prompt: str, timeout: int = 240) -> Optional[dict]:
         return None
 
     if result.returncode != 0:
-        log.error("claude -p rc=%d, stderr=%s", result.returncode, result.stderr[:300])
+        stdout_tail = (result.stdout or "")[-500:]
+        stderr_tail = (result.stderr or "")[-500:]
+        log.error(
+            "claude -p rc=%d\nstdout (хвост, ≤500 симв.): %s\nstderr (хвост, ≤500 симв.): %s",
+            result.returncode, stdout_tail, stderr_tail,
+        )
+        _consecutive_rc_failures += 1
+        if _consecutive_rc_failures >= MAX_CONSECUTIVE_RC_FAILURES:
+            log.error(
+                "%d запусков claude -p подряд завершились с rc != 0 — похоже, исчерпан лимит "
+                "аккаунта. Прерываем весь запуск билдера",
+                _consecutive_rc_failures,
+            )
+            sys.exit(1)
         return None
+
+    _consecutive_rc_failures = 0
 
     raw = _strip_code_fence(result.stdout or "")
     if not raw:
@@ -726,18 +776,28 @@ def call_claude(prompt: str, timeout: int = 240) -> Optional[dict]:
 
     # Прямой парсинг
     try:
-        return json.loads(raw)
+        data = json.loads(raw)
     except json.JSONDecodeError:
-        pass
+        data = None
+    if isinstance(data, dict):
+        return data
+    if data is not None:
+        log.warning("Ответ Claude — валидный JSON, но не объект (%s)", type(data).__name__)
 
     # Через regex/баланс скобок
     candidate = _extract_json_object(raw)
     if candidate:
         try:
-            return json.loads(candidate)
+            data = json.loads(candidate)
         except json.JSONDecodeError as e:
             log.warning("JSON не парсится после извлечения: %s. Превью: %.200s", e, candidate)
             return None
+        if isinstance(data, dict):
+            return data
+        log.warning(
+            "Извлечённый JSON — не объект (%s). Превью: %.200s", type(data).__name__, candidate,
+        )
+        return None
 
     log.warning("В ответе Claude не найден JSON-объект. Превью: %.200s", raw)
     return None
@@ -769,15 +829,23 @@ def build_lesson_record(
     else:
         source = "claude"
 
+    # claude_data приходит от call_claude, который теперь гарантирует dict, но значения
+    # ПОЛЕЙ внутри него — произвольны (Claude мог прислать null, число, список вместо
+    # строки). str(x or "") не даёт упасть на None/не-строке, а `or []` вместо голого
+    # .get(..., []) не спасает от НЕ-list значения (breakdown: "нет" осталось бы строкой) —
+    # поэтому breakdown отдельно проверяется через isinstance.
+    breakdown_raw = claude_data.get("breakdown")
+    breakdown = breakdown_raw if isinstance(breakdown_raw, list) else []
+
     record = {
         "day": day,
         "month_block": month,
-        "vietnamese": claude_data.get("vietnamese", "").strip(),
-        "transliteration_ru": claude_data.get("transliteration_ru", "").strip(),
-        "translation_ru": claude_data.get("translation_ru", "").strip(),
-        "breakdown": claude_data.get("breakdown", []) or [],
-        "context": claude_data.get("context", "").strip(),
-        "tone_tip": claude_data.get("tone_tip", "").strip(),
+        "vietnamese": str(claude_data.get("vietnamese") or "").strip(),
+        "transliteration_ru": str(claude_data.get("transliteration_ru") or "").strip(),
+        "translation_ru": str(claude_data.get("translation_ru") or "").strip(),
+        "breakdown": breakdown,
+        "context": str(claude_data.get("context") or "").strip(),
+        "tone_tip": str(claude_data.get("tone_tip") or "").strip(),
         "source": source,
         "wikibooks_url": wikibooks_url or "",
         "tags": tags,
@@ -790,10 +858,41 @@ REQUIRED_FIELDS = [
     "breakdown", "context", "tone_tip",
 ]
 
+# Текстовые поля урока, которые целиком идут в пост (для missing_fields и content_defects).
+_TEXT_FIELDS = ("vietnamese", "transliteration_ru", "translation_ru", "context", "tone_tip")
+# Обязательные подполя одного элемента breakdown — именно так называет их код (build_lesson_record
+# берёт их из claude_data["breakdown"], формат задан в CLAUDE_PROMPT_TEMPLATE).
+_BREAKDOWN_FIELDS = ("word", "transliteration", "meaning")
+
+
+def _is_nonempty_str(value) -> bool:
+    return isinstance(value, str) and bool(value.strip())
+
+
+def _valid_breakdown(value) -> bool:
+    """breakdown валиден только как непустой список словарей с непустыми строковыми
+    word/transliteration/meaning в каждом — что угодно другое (null, строка, список строк,
+    словарь без нужных ключей) не считается заполненным полем."""
+    if not isinstance(value, list) or not value:
+        return False
+    for item in value:
+        if not isinstance(item, dict):
+            return False
+        if not all(_is_nonempty_str(item.get(k)) for k in _BREAKDOWN_FIELDS):
+            return False
+    return True
+
 
 def missing_fields(record: dict) -> list[str]:
-    """Список обязательных полей, которые пусты или отсутствуют."""
-    return [k for k in REQUIRED_FIELDS if not record.get(k)]
+    """Список обязательных полей, которые пусты, отсутствуют или неправильного типа."""
+    out = []
+    for k in REQUIRED_FIELDS:
+        if k == "breakdown":
+            if not _valid_breakdown(record.get(k)):
+                out.append(k)
+        elif not _is_nonempty_str(record.get(k)):
+            out.append(k)
+    return out
 
 
 def lesson_is_valid(record: dict) -> bool:
@@ -806,6 +905,148 @@ def lesson_is_valid(record: dict) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# content_defects: самокоррекция/служебный мусор вместо чистого содержимого
+# ---------------------------------------------------------------------------
+# Инцидент дня 103: модель прислала "...нет, này тоже huyền. Вот исправленный вариант" —
+# JSON был валиден и все поля заполнены, missing_fields пропустил бы это как готовый урок.
+_DEFECT_ELLIPSIS_NO = re.compile(r"(?:\.\.\.|…)\s*нет\b", re.IGNORECASE)
+_DEFECT_SELF_CORRECTION = re.compile(
+    r"исправленн\w* вариант|исправлю|исправляю|```|\bjson\b|as an ai|"
+    r"i cannot|i can't|here is|\b(?:tone_tip|transliteration_ru|translation_ru|breakdown)\b",
+    re.IGNORECASE,
+)
+_DEFECT_LINE_START = re.compile(r"^\s*(?:Вот|Конечно|Here|Sure)\b", re.MULTILINE)
+
+# Игнорируем при определении "алфавита" символа: комбинирующие знаки (в т.ч. ударение),
+# цифры, пунктуацию, пробелы и управляющие символы.
+_IGNORED_UNICODE_CATEGORIES = ("M", "N", "P", "Z", "C")
+
+
+def _char_alphabet(ch: str) -> Optional[str]:
+    """Грубое определение 'алфавита' символа по первому слову его Unicode-имени
+    (CYRILLIC/LATIN/GEORGIAN/HIRAGANA/...). None — если символ не буква конкретного
+    алфавита (цифра/пунктуация/пробел/комбинирующий знак)."""
+    if unicodedata.category(ch)[0] in _IGNORED_UNICODE_CATEGORIES:
+        return None
+    name = unicodedata.name(ch, "")
+    if not name:
+        return None
+    return name.split(" ", 1)[0]
+
+
+def _mixed_script_tokens(text: str) -> list[str]:
+    """Токены (через пробел) кириллической транскрипции, содержащие буквы НЕ кириллицы —
+    Georgian/Hiragana/IPA-заимствования из Latin и т.п. Действует только если в поле в
+    целом есть кириллица (то есть это и правда транскрипция, а не что-то ещё)."""
+    field_alphabets = {a for a in (_char_alphabet(ch) for ch in text) if a}
+    if "CYRILLIC" not in field_alphabets or len(field_alphabets) <= 1:
+        return []
+    bad = []
+    for token in text.split():
+        token_alphabets = {a for a in (_char_alphabet(ch) for ch in token) if a}
+        if any(a != "CYRILLIC" for a in token_alphabets):
+            bad.append(token)
+    return bad
+
+
+def content_defects(record: dict) -> list[str]:
+    """Признаки того, что текстовые поля урока содержат самокоррекцию/служебный мусор
+    вместо чистого содержимого, или что кириллическая транскрипция засорена буквами
+    другого алфавита. В отличие от missing_fields, здесь поля формально непустые —
+    проблема в СОДЕРЖИМОМ. Список пуст ⇔ дефектов не найдено."""
+    defects: list[str] = []
+
+    def check_text(label: str, value) -> None:
+        if not isinstance(value, str) or not value:
+            return
+        if _DEFECT_ELLIPSIS_NO.search(value):
+            defects.append(f"{label}: похоже на самокоррекцию модели («…нет»)")
+        m = _DEFECT_SELF_CORRECTION.search(value)
+        if m:
+            defects.append(f"{label}: служебный/самокоррекционный текст ({m.group(0)!r})")
+        if _DEFECT_LINE_START.search(value):
+            defects.append(f"{label}: строка начинается как ответ ассистента, а не контент урока")
+
+    def check_transliteration(label: str, value) -> None:
+        if not isinstance(value, str) or not value:
+            return
+        for token in _mixed_script_tokens(value):
+            defects.append(f"{label}: транскрипция смешивает кириллицу с другим алфавитом («{token}»)")
+
+    for field in _TEXT_FIELDS:
+        check_text(field, record.get(field))
+    check_transliteration("transliteration_ru", record.get("transliteration_ru"))
+
+    breakdown = record.get("breakdown")
+    if isinstance(breakdown, list):
+        for idx, item in enumerate(breakdown):
+            if not isinstance(item, dict):
+                continue
+            for bf in _BREAKDOWN_FIELDS:
+                check_text(f"breakdown[{idx}].{bf}", item.get(bf))
+            check_transliteration(f"breakdown[{idx}].transliteration", item.get("transliteration"))
+
+    return defects
+
+
+# ---------------------------------------------------------------------------
+# Проверка длины отрендеренного поста (лимит Telegram)
+# ---------------------------------------------------------------------------
+def _fallback_render_text(record: dict) -> str:
+    """Грубая, заведомо НЕ заниженная реконструкция текста поста — используется, если
+    vietnamese_bot.format_post недоступен (например, файл сейчас правит другой
+    исполнитель, и он временно не импортируется). Блоки разделены пустой строкой
+    везде (реальный формат местами компактнее) и секция Wikibooks добавлена всегда —
+    так оценка не может оказаться МЕНЬШЕ настоящей длины."""
+    breakdown = record.get("breakdown")
+    breakdown_lines = []
+    if isinstance(breakdown, list):
+        for item in breakdown:
+            if not isinstance(item, dict):
+                continue
+            breakdown_lines.append(
+                "• {} ({}) — {}".format(
+                    item.get("word", ""), item.get("transliteration", ""), item.get("meaning", ""),
+                )
+            )
+    tags = record.get("tags")
+    tags_line = " ".join(tags) if isinstance(tags, list) else ""
+
+    blocks = [
+        f"🇻🇳 УРОК ВЬЕТНАМСКОГО — День {record.get('day')} / 365",
+        f"📌 Фраза: {record.get('vietnamese', '')}",
+        f"🔊 Транскрипция: {record.get('transliteration_ru', '')}",
+        f"🇷🇺 Перевод: {record.get('translation_ru', '')}",
+        "📖 Разбор:\n" + "\n".join(breakdown_lines),
+        "💬 Когда использовать:\n" + str(record.get("context", "")),
+        "🎵 Тон-лайфхак:\n" + str(record.get("tone_tip", "")),
+        "📚 По материалам Wikibooks (CC BY-SA)",
+        tags_line,
+    ]
+    return "\n\n".join(b for b in blocks if b)
+
+
+def _render_lesson_text(record: dict) -> str:
+    """Рендерит пост ТОЧНО так же, как его увидят подписчики — через настоящий
+    vietnamese_bot.format_post, если модуль сейчас можно импортировать без побочных
+    эффектов (импорт — лениво, внутри функции: vietnamese_bot.py — чужой файл, и если
+    он в моменте не импортируется, это не должно ронять билдер). Иначе — консервативная
+    локальная оценка."""
+    try:
+        from vietnamese_bot import format_post
+        return format_post(record, False)
+    except Exception as e:
+        log.debug("vietnamese_bot.format_post недоступен (%s) — консервативная оценка длины", e)
+        return _fallback_render_text(record)
+
+
+def post_too_long(record: dict) -> tuple[bool, int]:
+    """(превышен ли лимит, длина в UTF-16 code units — так же, как считает сам Telegram)."""
+    length = len(_render_lesson_text(record).encode("utf-16-le")) // 2
+    return length > MAX_POST_UTF16_LEN, length
+
+
+# ---------------------------------------------------------------------------
 # I/O для vietnamese_lessons.json
 # ---------------------------------------------------------------------------
 def load_lessons() -> list[dict]:
@@ -814,13 +1055,19 @@ def load_lessons() -> list[dict]:
     try:
         with open(LESSONS_PATH, encoding="utf-8") as f:
             data = json.load(f)
-            if isinstance(data, list):
-                return data
-            log.warning("vietnamese_lessons.json: не массив — будет перезаписан")
-            return []
     except json.JSONDecodeError as e:
         log.error("vietnamese_lessons.json повреждён: %s — отказываюсь записывать", e)
         sys.exit(1)
+
+    if not isinstance(data, list):
+        # Раньше здесь тихо возвращался [] — save_lessons_atomic следом переписал бы файл
+        # только что сгенерированными уроками, а всё остальное содержимое было бы потеряно.
+        log.error(
+            "vietnamese_lessons.json: верхний уровень не массив (%s) — отказываюсь "
+            "перезаписывать, нужна ручная проверка файла", type(data).__name__,
+        )
+        sys.exit(1)
+    return data
 
 
 def save_lessons_atomic(lessons: list[dict]) -> None:
@@ -840,26 +1087,121 @@ def upsert_lesson(lessons: list[dict], record: dict) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
+# Лок против параллельных запусков билдера
+# ---------------------------------------------------------------------------
+def acquire_lessons_lock(lock_path: Path):
+    """Эксклюзивный неблокирующий fcntl-лок на всё время main(). Без него два билдера,
+    запущенные параллельно (например, на разные месяцы одновременно), читают
+    vietnamese_lessons.json независимо в начале работы и, сохраняя после КАЖДОГО урока,
+    каждый раз переписывают файл своей веткой списка в памяти — уроки, сохранённые другим
+    процессом между этими чтениями, тихо теряются. Лок держится открытым до конца
+    процесса — ОС снимает его автоматически при завершении, даже при аварийном выходе."""
+    lock_file = open(lock_path, "w")
+    try:
+        fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        log.error(
+            "Не удалось стартовать: другой запуск билдера уже работает (занят лок %s) — "
+            "выходим, чтобы не потерять уроки друг друга",
+            lock_path,
+        )
+        sys.exit(1)
+    return lock_file
+
+
+def _read_current_day(state_path: Path) -> Optional[int]:
+    """Читает current_day из vietnamese_state.json. ТОЛЬКО чтение — этим файлом управляет
+    vietnamese_bot.py, билдер его не меняет. Нужен, чтобы --force не перезаписывал уже
+    опубликованные дни (см. generate_for_month). Любая проблема с state-файлом (нет
+    файла, битый JSON, не тот тип верхнего уровня/current_day) — не повод падать: просто
+    считаем, что опубликованных уроков нет, с явным предупреждением в лог."""
+    if not state_path.exists():
+        log.warning(
+            "%s не найден — считаем, что опубликованных уроков ещё нет", state_path,
+        )
+        return None
+    try:
+        with open(state_path, encoding="utf-8") as f:
+            data = json.load(f)
+    except (json.JSONDecodeError, OSError) as e:
+        log.warning("%s не читается (%s) — считаем, что опубликованных уроков нет", state_path, e)
+        return None
+    if not isinstance(data, dict):
+        log.warning(
+            "%s: верхний уровень не объект — считаем, что опубликованных уроков нет", state_path,
+        )
+        return None
+    day = data.get("current_day")
+    if not isinstance(day, int) or isinstance(day, bool):
+        log.warning(
+            "%s: current_day=%r невалиден — считаем, что опубликованных уроков нет",
+            state_path, day,
+        )
+        return None
+    return day
+
+
+# ---------------------------------------------------------------------------
 # Главная логика
 # ---------------------------------------------------------------------------
-def generate_for_month(month: int, *, preview: bool, force: bool, limit: Optional[int]) -> list[dict]:
-    days = list(month_to_day_range(month))
+def generate_for_month(
+    month: int,
+    *,
+    preview: bool,
+    force: bool,
+    limit: Optional[int],
+    allow_published: bool = False,
+    only_days: Optional[set[int]] = None,
+) -> list[dict]:
+    full_days = list(month_to_day_range(month))
     topics = LESSON_TOPICS.get(month, [])
-    if len(topics) < len(days):
+    if len(topics) < len(full_days):
         log.warning("Для месяца %d тем %d, дней %d — некоторые дни будут без специфической темы",
-                    month, len(topics), len(days))
+                    month, len(topics), len(full_days))
+    # Тема дня определяется позицией дня ВНУТРИ МЕСЯЦА, а не позицией в (возможно
+    # отфильтрованном через --day) списке ниже — иначе --day перепутал бы темы дней.
+    topic_by_day = {
+        d: (topics[i] if i < len(topics) else f"Тема дня {d} (месяц {month})")
+        for i, d in enumerate(full_days)
+    }
+
+    days = full_days
+    if only_days is not None:
+        unknown = sorted(only_days - set(full_days))
+        if unknown:
+            log.warning("--day: дни %s вне диапазона месяца %d (%d..%d) — игнорируются",
+                        unknown, month, full_days[0], full_days[-1])
+        days = [d for d in full_days if d in only_days]
+        if not days:
+            log.error("--day: ни один из указанных дней не входит в месяц %d", month)
+            return []
+
+    # С --force перезаписываются только ЕЩЁ НЕ опубликованные дни (day >= current_day из
+    # state) — иначе --force для месяца, где часть дней уже прочитана подписчиками и
+    # вручную поправлена (см. историю правок 2026-08-21), стирает эти правки при
+    # перегенерации всего месяца. --allow-published снимает это ограничение явно.
+    published_before: Optional[int] = None
+    if force and not allow_published:
+        published_before = _read_current_day(STATE_PATH)
+        if published_before is not None:
+            log.info(
+                "--force: дни < %d считаются уже опубликованными и будут пропущены "
+                "(--allow-published перезапишет и их)",
+                published_before,
+            )
 
     existing = load_lessons()
     existing_by_day = {l.get("day"): l for l in existing}
 
     log.info("=== Месяц %d: %s ===", month, MONTH_THEMES.get(month, ""))
-    log.info("Дни: %d..%d (всего %d)", days[0], days[-1], len(days))
+    log.info("Дни месяца: %d..%d (всего %d, к генерации в этом запуске: %d)",
+              full_days[0], full_days[-1], len(full_days), len(days))
     log.info("Существующих уроков в JSON: %d", len(existing))
 
     generated: list[dict] = []
     produced = 0
 
-    for idx, day in enumerate(days):
+    for day in days:
         if limit is not None and produced >= limit:
             log.info("Достигнут --limit=%d, остановка", limit)
             break
@@ -868,8 +1210,16 @@ def generate_for_month(month: int, *, preview: bool, force: bool, limit: Optiona
             log.info("Урок %d уже есть — пропуск (используйте --force для перезаписи)", day)
             continue
 
-        topic = topics[idx] if idx < len(topics) else f"Тема дня {day} (месяц {month})"
-        log.info("Урок %d/%d: «%s»", day, days[-1], topic)
+        if force and published_before is not None and day < published_before:
+            log.info(
+                "Урок %d уже опубликован (current_day=%d в state) — пропуск даже с --force "
+                "(используйте --allow-published, чтобы перезаписать)",
+                day, published_before,
+            )
+            continue
+
+        topic = topic_by_day[day]
+        log.info("Урок %d/%d: «%s»", day, full_days[-1], topic)
 
         excerpt, wb_url = find_wikibooks_excerpt(month, topic)
         used_wikibooks = bool(excerpt)
@@ -891,7 +1241,7 @@ def generate_for_month(month: int, *, preview: bool, force: bool, limit: Optiona
         for attempt in range(1, MAX_ATTEMPTS + 1):
             claude_data = call_claude(prompt + retry_hint)
             if not claude_data:
-                log.warning("Урок %d: попытка %d/%d — Claude не дал валидный JSON",
+                log.warning("Урок %d: попытка %d/%d — Claude не дал валидный JSON-объект",
                             day, attempt, MAX_ATTEMPTS)
                 continue
 
@@ -903,19 +1253,48 @@ def generate_for_month(month: int, *, preview: bool, force: bool, limit: Optiona
                 used_wikibooks=used_wikibooks,
             )
 
-            if lesson_is_valid(candidate):
-                record = candidate
-                break
-
             missing = missing_fields(candidate)
-            log.warning("Урок %d: попытка %d/%d — не заполнены поля: %s",
-                        day, attempt, MAX_ATTEMPTS, ", ".join(missing))
-            retry_hint = (
-                "\n\nВАЖНО: в прошлый раз ты не заполнил обязательные поля: "
-                + ", ".join(missing)
-                + ". Верни JSON со ВСЕМИ полями схемы, ни одно не должно быть пустым "
-                  "или отсутствовать."
-            )
+            if missing:
+                log.warning("Урок %d: попытка %d/%d — не заполнены поля: %s",
+                            day, attempt, MAX_ATTEMPTS, ", ".join(missing))
+                retry_hint = (
+                    "\n\nВАЖНО: в прошлый раз ты не заполнил обязательные поля: "
+                    + ", ".join(missing)
+                    + ". Верни JSON со ВСЕМИ полями схемы, ни одно не должно быть пустым "
+                      "или отсутствовать."
+                )
+                continue
+
+            # Поля формально заполнены, но могли прийти с самокоррекцией/служебным мусором
+            # (инцидент дня 103: "...нет, này тоже huyền. Вот исправленный вариант") или с
+            # транскрипцией, засорённой буквами другого алфавита — missing_fields это не ловит.
+            defects = content_defects(candidate)
+            if defects:
+                log.warning("Урок %d: попытка %d/%d — дефекты содержимого: %s",
+                            day, attempt, MAX_ATTEMPTS, "; ".join(defects))
+                retry_hint = (
+                    "\n\nВАЖНО: прошлый ответ содержал брак вместо чистого содержимого урока: "
+                    + "; ".join(defects)
+                    + ". Верни ТОЛЬКО один финальный чистый JSON без самокоррекций, объяснений, "
+                      "markdown-обёрток и служебных фраз; кириллическая транскрипция должна "
+                      "быть только кириллицей."
+                )
+                continue
+
+            too_long, length = post_too_long(candidate)
+            if too_long:
+                log.warning(
+                    "Урок %d: попытка %d/%d — пост длиннее лимита (%d > %d UTF-16 code units)",
+                    day, attempt, MAX_ATTEMPTS, length, MAX_POST_UTF16_LEN,
+                )
+                retry_hint = (
+                    "\n\nВАЖНО: получившийся пост слишком длинный — сократи текст (особенно "
+                    "context и tone_tip), сохранив структуру JSON и смысл."
+                )
+                continue
+
+            record = candidate
+            break
 
         if record is None:
             log.warning("Урок %d: %d попыток исчерпано — пропуск", day, MAX_ATTEMPTS)
@@ -926,8 +1305,13 @@ def generate_for_month(month: int, *, preview: bool, force: bool, limit: Optiona
         produced += 1
 
         if not preview:
-            existing = upsert_lesson(existing, record)
+            # Перечитываем файл заново ПРЯМО ПЕРЕД сохранением, а не переиспользуем `existing`,
+            # накопленный с начала запуска — так правки, внесённые вручную или другим
+            # процессом, пока этот урок генерировался (это может занимать минуты), не
+            # затираются полным перезаписыванием файла версией из памяти.
+            existing = upsert_lesson(load_lessons(), record)
             save_lessons_atomic(existing)
+            existing_by_day = {l.get("day"): l for l in existing}
 
     return generated
 
@@ -940,7 +1324,13 @@ def main() -> int:
     parser.add_argument("--preview", action="store_true",
                         help="Печать в stdout, не сохранять JSON")
     parser.add_argument("--force", action="store_true",
-                        help="Перезаписать существующие уроки месяца")
+                        help="Перезаписать существующие уроки месяца (уже опубликованные "
+                             "дни пропускаются — см. --allow-published)")
+    parser.add_argument("--allow-published", action="store_true",
+                        help="Вместе с --force перезаписать и уже опубликованные дни "
+                             "(current_day из vietnamese_state.json)")
+    parser.add_argument("--day", type=str, default=None,
+                        help="Сгенерировать только перечисленные дни месяца: --day 5 или --day 5,12,13")
     parser.add_argument("--limit", type=int, default=None,
                         help="Ограничить число генераций (для теста)")
     args = parser.parse_args()
@@ -949,15 +1339,36 @@ def main() -> int:
         log.error("--month должен быть 1..12, получено %s", args.month)
         return 2
 
+    only_days: Optional[set[int]] = None
+    if args.day:
+        try:
+            only_days = {int(x.strip()) for x in args.day.split(",") if x.strip()}
+        except ValueError:
+            log.error("--day: не удалось разобрать список дней %r (ожидается N или N,M,...)", args.day)
+            return 2
+        if not only_days:
+            log.error("--day: пустой список дней")
+            return 2
+
+    # Лок держим на протяжении всего main(): вторая параллельно запущенная копия билдера
+    # (например, на другой месяц) читала бы тот же vietnamese_lessons.json независимо и
+    # своей записью затёрла бы уроки, уже сохранённые этим процессом (см. acquire_lessons_lock).
+    _lock_fh = acquire_lessons_lock(LESSONS_LOCK_PATH)  # noqa: F841 — держим ссылку, лок жив, пока жив файл
+
     log.info("=== Vietnamese lesson builder ===")
-    log.info("month=%d, preview=%s, force=%s, limit=%s",
-             args.month, args.preview, args.force, args.limit)
+    log.info(
+        "month=%d, preview=%s, force=%s, allow_published=%s, day=%s, limit=%s",
+        args.month, args.preview, args.force, args.allow_published,
+        sorted(only_days) if only_days else None, args.limit,
+    )
 
     generated = generate_for_month(
         args.month,
         preview=args.preview,
         force=args.force,
         limit=args.limit,
+        allow_published=args.allow_published,
+        only_days=only_days,
     )
 
     log.info("Итого сгенерировано: %d", len(generated))
