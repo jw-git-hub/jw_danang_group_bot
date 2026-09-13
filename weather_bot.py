@@ -1,15 +1,18 @@
 #!/usr/bin/env python3
 """
 Ежедневный прогноз погоды и AQI для Дананга → Telegram.
-Запуск: python3 weather_bot.py
-Cron: 0 7 * * * cd /path/to/danang-bots && python3 weather_bot.py >> logs/weather.log 2>&1
+Запуск: python3 weather_bot.py [--dry-run] [--test] [--force] [--plain] [--rich-list]
+Cron: 0 0 * * * cd /path/to/danang-bots && python3 weather_bot.py >> logs/weather.log 2>&1
+  (00:00 UTC = 07:00 в Дананге — сервер работает в UTC)
 """
 
+import fcntl
 import json
 import logging
 import os
 import re
 import sys
+import tempfile
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -18,7 +21,7 @@ import requests
 from bs4 import BeautifulSoup
 
 from facebook_poster import send_facebook_post
-from telegram_sender import send_rich_message, send_telegram_message
+from telegram_sender import HEARTBEAT_PATH, SendOutcomeUnknown, send_rich_message, send_telegram_message
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -34,6 +37,7 @@ log = logging.getLogger("weather_bot")
 # Config
 # ---------------------------------------------------------------------------
 CONFIG_PATH = Path(__file__).parent / "config.json"
+LOCK_PATH = Path(__file__).parent / "weather_bot.lock"
 
 def load_config():
     try:
@@ -103,12 +107,21 @@ def fetch_aqi(cfg):
                 aqi_payload["aqi"] = None
             return aqi_payload
         except requests.exceptions.RequestException as e:
+            # Токен лежит в query string — str(e) у requests (таймауты, DNS,
+            # HTTPError от raise_for_status) содержит полный URL вместе с ним;
+            # без маскирования токен утекает в logs/*.log при любом сетевом сбое.
+            masked = str(e).replace(token, "<AQI_TOKEN>")
             if attempt < 2:
-                log.warning("AQI fetch attempt %d/3 failed: %s — retrying in %ds", attempt + 1, e, backoff[attempt])
+                log.warning("AQI fetch attempt %d/3 failed: %s — retrying in %ds", attempt + 1, masked, backoff[attempt])
                 time.sleep(backoff[attempt])
             else:
-                log.error("AQI fetch attempt 3/3 failed: %s — giving up", e)
-                raise
+                log.error("AQI fetch attempt 3/3 failed: %s — giving up", masked)
+                # Новое исключение с уже замаскированным текстом и без цепочки
+                # (from None) — иначе main(), поймав его как `except Exception`,
+                # залогирует %s от ЭТОГО объекта (что ок), но traceback/repr
+                # исходного e с сырым токеном не должен всплыть ни при каких
+                # условиях логирования выше по стеку.
+                raise RuntimeError(masked) from None
 
 # ---------------------------------------------------------------------------
 # Курсы валют (open.er-api.com — бесплатно, без ключа; frankfurter — fallback)
@@ -195,6 +208,21 @@ def fetch_exchange_rates():
 PRICE_CACHE_PATH = Path(__file__).parent / "price_cache.json"
 PRICE_CACHE_MAX_AGE_DAYS = 7
 
+# Диапазоны для валидации значения ИЗ КЭША — те же, что живой парсер уже
+# применяет к свежесобранной цене (см. fetch_petrol_price/fetch_gold_price).
+# Кэш — это файл на диске, который мог быть обрезан аварийным завершением
+# процесса или записан старой версией кода; без этой проверки null/строка/
+# число-мусор из кэша доходили до format_vnd() и роняли оба форматтера поста.
+_CACHE_SANE_RANGES = {
+    "petrol": (15_000, 40_000),
+    "gold": (5_000_000, 25_000_000),
+}
+
+# Устанавливается в main() из --dry-run. В dry-run мы всё равно ходим за
+# ценами (чтобы показать честный превью поста), но не должны трогать
+# price_cache.json на диске — это режим "только посмотреть".
+_DRY_RUN = False
+
 
 def _load_price_cache():
     try:
@@ -208,31 +236,51 @@ def _load_price_cache():
 
 
 def _save_price_cache(cache):
-    # Атомарная запись через .tmp + os.replace — чтобы процесс, упавший
-    # посреди записи (например по OOM или kill -9), не оставил битый JSON,
-    # которым потом не сможет воспользоваться следующий запуск как fallback.
-    tmp_path = PRICE_CACHE_PATH.with_suffix(".json.tmp")
+    # Атомарная запись через temp-файл в той же директории + os.replace.
+    # Раньше имя temp-файла было фиксированным (.json.tmp) — два процесса,
+    # пишущих кэш одновременно (до появления файлового лока или в обход
+    # него), затирали временный файл друг друга. mkstemp даёт уникальное
+    # имя, так что параллельные записи больше не сталкиваются.
+    fd, tmp_name = tempfile.mkstemp(
+        prefix=PRICE_CACHE_PATH.name + ".", suffix=".tmp", dir=str(PRICE_CACHE_PATH.parent)
+    )
     try:
-        with open(tmp_path, "w") as f:
+        with os.fdopen(fd, "w") as f:
             json.dump(cache, f, ensure_ascii=False, indent=2)
-        os.replace(tmp_path, PRICE_CACHE_PATH)
+        os.replace(tmp_name, PRICE_CACHE_PATH)
     except OSError as e:
         log.warning("Price cache: не удалось сохранить %s: %s", PRICE_CACHE_PATH, e)
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
 
 
-def _update_price_cache(key, value):
+def _update_price_cache(key, value, label=None):
+    if _DRY_RUN:
+        return
     cache = _load_price_cache()
-    cache[key] = {
+    entry = {
         "value": value,
         "fetched_at": datetime.now(timezone.utc).isoformat(),
     }
+    if label is not None:
+        entry["label"] = label
+    cache[key] = entry
     _save_price_cache(cache)
 
 
 def _get_cached_price(key, max_age_days=PRICE_CACHE_MAX_AGE_DAYS):
-    """Возвращает (value, fetched_at) из кэша, если он не старше max_age_days
-    (offset-aware datetime, UTC), иначе None — старый кэш лучше не публиковать
-    вовсе, чем выдавать за актуальную цену многомесячной давности."""
+    """Возвращает (value, fetched_at, label) из кэша, если он не старше
+    max_age_days (offset-aware datetime, UTC) и value прошло проверку
+    типа/диапазона, иначе None — старый или битый кэш лучше не публиковать
+    вовсе, чем выдавать за актуальную цену многомесячной давности (или уронить
+    форматирование поста).
+
+    label — то, что было сохранено вместе со значением (см.
+    _update_price_cache), либо None для записей старого формата без label;
+    вызывающий код сам подставляет дефолтную подпись в этом случае.
+    """
     entry = _load_price_cache().get(key)
     if not entry:
         return None
@@ -241,11 +289,18 @@ def _get_cached_price(key, max_age_days=PRICE_CACHE_MAX_AGE_DAYS):
         fetched_at = datetime.fromisoformat(entry["fetched_at"])
     except (KeyError, TypeError, ValueError):
         return None
+    # bool — подкласс int в Python, поэтому исключаем его отдельно; null/строка
+    # ("21.830" и т.п.) в кэше раньше долетали до format_vnd() и роняли пост.
+    if not isinstance(value, int) or isinstance(value, bool):
+        return None
+    sane_range = _CACHE_SANE_RANGES.get(key)
+    if sane_range and not (sane_range[0] <= value <= sane_range[1]):
+        return None
     if fetched_at.tzinfo is None:
         fetched_at = fetched_at.replace(tzinfo=timezone.utc)
     if datetime.now(timezone.utc) - fetched_at > timedelta(days=max_age_days):
         return None
-    return value, fetched_at
+    return value, fetched_at, entry.get("label")
 
 # ---------------------------------------------------------------------------
 # Цена бензина RON 95-III (webgia.com — агрегатор Petrolimex)
@@ -306,7 +361,7 @@ def fetch_petrol_price():
                     except ValueError:
                         continue
                     if 15000 <= val <= 40000:
-                        _update_price_cache("petrol", val)
+                        _update_price_cache("petrol", val, label)
                         log.info("Petrol: %s = %d ₫/л", label, val)
                         return val, None, label
         log.warning("Petrol: ни одна марка бензина не найдена с ценой на webgia.com")
@@ -315,9 +370,11 @@ def fetch_petrol_price():
 
     cached = _get_cached_price("petrol")
     if cached:
-        value, fetched_at = cached
+        value, fetched_at, label = cached
+        # Запись старого формата (до появления label в кэше) — общая подпись.
+        label = label or "бензин"
         log.warning("Petrol: источники недоступны, берём кэш от %s", fetched_at)
-        return value, fetched_at, "бензин"
+        return value, fetched_at, label
     log.warning("Petrol: нет ни свежих данных, ни валидного кэша — блок не публикуем")
     return None
 
@@ -376,7 +433,7 @@ def fetch_gold_price():
 
                 sell = prices[1]
                 if 5_000_000 <= sell <= 25_000_000:
-                    _update_price_cache("gold", sell)
+                    _update_price_cache("gold", sell, "SJC 9999 (продажа)")
                     log.info("Gold: SJC слиток, продажа = %d ₫/чи", sell)
                     return sell, None, "SJC 9999 (продажа)"
 
@@ -387,7 +444,9 @@ def fetch_gold_price():
     # Попытка 2: DOJI XML (цены за chỉ × 1000, например 16,630 = 16.630.000).
     # Здесь Buy/Sell — именованные атрибуты (не regex по свободному тексту),
     # но таблица содержит и не-SJC золото (кольца, слитки других проб) —
-    # фильтруем по Name, чтобы не подхватить чужую строку.
+    # фильтруем по Name, чтобы не подхватить чужую строку. Берём Sell (цена
+    # продажи) — как и в основном источнике выше, иначе кэш и подпись
+    # "продажа" молча разъезжаются с ценой покупки.
     try:
         resp = requests.get(
             "https://giavang.doji.vn/api/giavang/get-bang-gia-doji",
@@ -399,30 +458,31 @@ def fetch_gold_price():
         for row_match in re.finditer(r"<Row\b[^>]*/>", resp.text):
             tag = row_match.group(0)
             name_m = re.search(r"Name=['\"]([^'\"]+)['\"]", tag)
-            buy_m = re.search(r"Buy=['\"]([\d,]+)['\"]", tag)
-            if not name_m or not buy_m or "sjc" not in name_m.group(1).lower():
+            sell_m = re.search(r"Sell=['\"]([\d,]+)['\"]", tag)
+            if not name_m or not sell_m or "sjc" not in name_m.group(1).lower():
                 continue
-            raw = buy_m.group(1).replace(",", "")
+            raw = sell_m.group(1).replace(",", "")
             try:
                 val = int(raw)
             except ValueError:
                 continue
             # У DOJI цены в тысячах VND/chỉ (например 16630 → 16 630 000)
             if 5_000 <= val <= 25_000:
-                _update_price_cache("gold", val * 1000)
-                return val * 1000, None
+                _update_price_cache("gold", val * 1000, "SJC 9999 (продажа)")
+                return val * 1000, None, "SJC 9999 (продажа)"
         log.warning("Gold: подходящие SJC-строки не найдены в DOJI XML")
     except (requests.RequestException, ValueError, AttributeError, TypeError) as e:
         log.warning("Gold DOJI fetch failed: %s", e)
 
     cached = _get_cached_price("gold")
     if cached:
-        value, fetched_at = cached
+        value, fetched_at, label = cached
+        label = label or "SJC 9999 (продажа)"
         log.warning(
             "Gold: все источники недоступны/неоднозначны, используем кэш от %s: %d VND/чи",
             fetched_at.isoformat(), value,
         )
-        return value, fetched_at
+        return value, fetched_at, label
 
     log.warning(
         "Gold: источники недоступны и валидного кэша (не старше %d дней) нет — блок не публикуем",
@@ -729,12 +789,78 @@ def format_post_rich(weather_data, aqi_data, fx_data=None, petrol=None, gold=Non
 # вызывалась, дублировала retry-логику и, вдобавок, светила токен бота в лог.
 
 # ---------------------------------------------------------------------------
+# Лок и защита от повторной публикации
+# ---------------------------------------------------------------------------
+# Держим ссылку на дескриптор лока на уровне модуля: если оставить её только
+# локальной переменной внутри main() и не использовать дальше, сборщик мусора
+# рано или поздно закроет файл и снимет flock ещё до конца процесса.
+_lock_fh = None
+
+
+def acquire_lock(lock_path):
+    """Неблокирующий файловый лок: вторая одновременно запущенная копия
+    weather_bot читала бы тот же price_cache.json/heartbeats.json и могла
+    столкнуться при записи или опубликовать дубль. Лок держится открытым до
+    конца процесса — ОС снимает его автоматически при завершении, даже при
+    аварийном выходе. (Тот же паттерн, что acquire_lock в expat_guide_bot.py.)
+    """
+    lock_file = open(lock_path, "w")
+    try:
+        fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        log.info(
+            "Другая копия weather_bot уже выполняется (занят lock-файл %s) — выходим с кодом 0",
+            lock_path,
+        )
+        sys.exit(0)
+    return lock_file
+
+
+def _already_posted_today_danang(heartbeat_path=HEARTBEAT_PATH, rubric="weather"):
+    """True, если последняя успешная публикация рубрики (heartbeats.json,
+    см. record_heartbeat в telegram_sender.py) приходится на сегодняшнюю дату
+    по времени Дананга (UTC+7).
+
+    Файл читается только на чтение. Любая аномалия — файла нет, битый JSON,
+    неожиданная форма записи (нет ключа rubric/last_posted_at, не строка и
+    т.п.) — трактуется как "публикации сегодня не было": защита от дубля не
+    должна сама по себе останавливать публикацию из-за постороннего сбоя.
+    """
+    try:
+        with open(heartbeat_path, encoding="utf-8") as f:
+            data = json.load(f)
+        last_posted_at = data[rubric]["last_posted_at"]
+        last_dt = datetime.fromisoformat(last_posted_at)
+    except (FileNotFoundError, json.JSONDecodeError, KeyError, TypeError, ValueError, OSError):
+        return False
+    if last_dt.tzinfo is None:
+        last_dt = last_dt.replace(tzinfo=timezone.utc)
+    danang_tz = timezone(timedelta(hours=7))
+    return last_dt.astimezone(danang_tz).date() == datetime.now(danang_tz).date()
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 def main():
+    # Разбор и валидация аргументов — самое первое действие в main(), до
+    # лока/сети/чтения state. Неизвестный флаг обычно значит опечатку в
+    # cron/руках оператора; лучше явно упасть с usage, чем молча проигнорировать
+    # его и запустить публикацию не в том режиме, который имелся в виду.
+    allowed_args = {"--dry-run", "--test", "--force", "--plain", "--rich-list"}
+    unknown_args = [a for a in sys.argv[1:] if a not in allowed_args]
+    if unknown_args:
+        print(f"Usage: {Path(sys.argv[0]).name} [--dry-run] [--test] [--force] [--plain] [--rich-list]",
+              file=sys.stderr)
+        print(f"Неизвестный аргумент(ы): {' '.join(unknown_args)}", file=sys.stderr)
+        sys.exit(2)
+
     log.info("=== Weather bot start ===")
     dry_run = "--dry-run" in sys.argv
     test_mode = "--test" in sys.argv
+    force = "--force" in sys.argv
+    global _DRY_RUN
+    _DRY_RUN = dry_run
     # Rich-разметка — рабочий формат дайджеста (таблицы показателей, цитата с AQI,
     # разделитель перед финансовой частью). --plain оставлен как аварийный откат
     # на случай проблем с sendRichMessage.
@@ -744,8 +870,24 @@ def main():
         log.info("DRY RUN mode — Telegram/Facebook отправка отключена")
     if test_mode:
         log.info("TEST mode — постим в тестовую группу, Facebook пропускаем")
+    if force:
+        log.info("FORCE mode — игнорируем защиту от повторной публикации за сегодня")
     if rich_mode:
         log.info("RICH mode — sendRichMessage, стиль %s", rich_style)
+
+    # Неблокирующий лок против второй одновременно запущенной копии — не берём
+    # его для --dry-run, этот режим ничего не пишет и не публикует, мешать
+    # боевому запуску незачем.
+    if not dry_run:
+        global _lock_fh
+        _lock_fh = acquire_lock(LOCK_PATH)
+
+    # Защита от повторной публикации в те же сутки по времени Дананга — если
+    # только не просят явно (--force) или это тестовый/пробный прогон.
+    if not (force or test_mode or dry_run) and _already_posted_today_danang():
+        log.info("Погода уже была опубликована сегодня (Дананг, UTC+7) — выходим с кодом 0")
+        sys.exit(0)
+
     cfg = load_config()
 
     # Fetch data
@@ -849,19 +991,26 @@ def main():
 
     # Send
     thread_id = cfg["telegram"].get("weather_thread_id")
-    if send_rich:
-        msg_id = send_rich_message(cfg, rich_html, thread_id=thread_id, test=test_mode,
-                                   rubric="weather")
-        if msg_id is None:
-            # sendRichMessage может быть недоступен на боевом API или отвергнуть
-            # разметку — plain-текст уже сформирован, откатываемся на него,
-            # а не теряем публикацию целиком.
-            log.warning("sendRichMessage вернул None — откатываемся на обычный текст (plain fallback)")
+    try:
+        if send_rich:
+            msg_id = send_rich_message(cfg, rich_html, thread_id=thread_id, test=test_mode,
+                                       rubric="weather")
+            if msg_id is None:
+                # sendRichMessage может быть недоступен на боевом API или отвергнуть
+                # разметку — plain-текст уже сформирован, откатываемся на него,
+                # а не теряем публикацию целиком.
+                log.warning("sendRichMessage вернул None — откатываемся на обычный текст (plain fallback)")
+                msg_id = send_telegram_message(cfg, post_text, thread_id=thread_id, test=test_mode,
+                                              rubric="weather")
+        else:
             msg_id = send_telegram_message(cfg, post_text, thread_id=thread_id, test=test_mode,
                                           rubric="weather")
-    else:
-        msg_id = send_telegram_message(cfg, post_text, thread_id=thread_id, test=test_mode,
-                                      rubric="weather")
+    except SendOutcomeUnknown as e:
+        # Запрос мог реально дойти до Telegram (таймаут на чтении/5xx/нечитаемый
+        # ответ) — повтор или plain-fallback рискуют задвоить пост в живой
+        # группе. Останавливаемся немедленно, без второй попытки.
+        log.error("Telegram: исход отправки неизвестен, не повторяем во избежание дубля: %s", e)
+        sys.exit(1)
     if not msg_id:
         log.error("Failed to send to Telegram")
         sys.exit(1)
