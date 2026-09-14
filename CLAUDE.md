@@ -6,7 +6,7 @@
 Telegram-боты для группы "РУССКИЙ ДАНАНГ" (@rus_danang, chat_id -100XXXXXXXXXX, форум с темами).
 
 - **weather_bot.py** — утренний дайджест: погода, AQI, курсы валют, топливо, золото → General чат (без thread_id)
-- **news_bot.py** — новости Дананга/Вьетнама, перевод через `claude -p`, → тема "Новости" (thread_id 1451)
+- **news_bot.py** — новости Дананга/Вьетнама, перевод через `claude -p --model sonnet`, → тема "Новости" (thread_id 1451)
 - **read_history.py** — чтение истории треда через Telethon (user account), наполнение трекера дедупликации
 - **vietnamese_bot.py** — урок вьетнамского дня из курса на 365 дней → тема уроков
 - **vietnamese_lesson_builder.py** — генератор уроков партиями (запускается вручную, не из cron)
