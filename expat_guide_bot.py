@@ -382,6 +382,10 @@ def main() -> None:
     cfg = load_config()
     guide_cfg = cfg.get("expat_guide", {}) or {}
 
+    if guide_cfg.get("enabled", True) is False:
+        log.info("Гайд экспата выключен в config.json (expat_guide.enabled = false) — ничего не публикую")
+        sys.exit(0)
+
     base_dir = Path(__file__).parent
     guide_path = Path(guide_cfg.get("guide_file", base_dir / "expat_guide.json"))
     state_path = Path(guide_cfg.get("state_file", base_dir / "expat_guide_state.json"))

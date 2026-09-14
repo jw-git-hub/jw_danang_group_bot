@@ -159,9 +159,36 @@ def last_post_fallback(rubric: str) -> datetime | None:
     return None
 
 
-def check_silence(heartbeats: dict) -> list[str]:
+def _expat_guide_disabled() -> bool:
+    """True, только если config.json.expat_guide.enabled СТРОГО равен false —
+    отсутствие ключа или любое другое значение означает "рубрика включена"
+    (поведение по умолчанию не меняется).
+
+    Нарочно не использует _read_json()/log: если бы эта проверка логировала
+    предупреждение о битом/отсутствующем config.json на каждом запуске —
+    включая --dry-run, который раньше вообще не трогал config.json, — это
+    само по себе меняло бы поведение сторожа для enabled=true/ключ отсутствует,
+    а оно обязано остаться байт-в-байт прежним. Поэтому любая проблема с
+    чтением здесь молча трактуется как "не выключено".
+    """
+    try:
+        with open(BASE / "config.json", encoding="utf-8") as f:
+            cfg = json.load(f)
+    except (OSError, ValueError, UnicodeDecodeError):
+        return False
+    guide_cfg = cfg.get("expat_guide") if isinstance(cfg, dict) else None
+    if not isinstance(guide_cfg, dict):
+        return False
+    return guide_cfg.get("enabled", True) is False
+
+
+def check_silence(heartbeats: dict, guide_disabled: bool = False) -> list[str]:
     problems = []
     for rubric, (title, max_hours, log_name) in RUBRICS.items():
+        if guide_disabled and rubric == "expat_guide":
+            # Рубрика выключена в config.json — не читаем ни heartbeats, ни
+            # state, ни лог: см. _expat_guide_disabled() и check_runway().
+            continue
         try:
             hb_entry = heartbeats.get(rubric) if isinstance(heartbeats, dict) else None
             hb = hb_entry.get("last_posted_at") if isinstance(hb_entry, dict) else None
@@ -187,7 +214,7 @@ def check_silence(heartbeats: dict) -> list[str]:
     return problems
 
 
-def check_runway() -> list[str]:
+def check_runway(guide_disabled: bool = False) -> list[str]:
     problems = []
 
     try:
@@ -239,40 +266,41 @@ def check_runway() -> list[str]:
         log.exception("Проверка запаса уроков вьетнамского упала")
         problems.append(f"❓ Проверка «Уроки вьетнамского» упала: {type(e).__name__}: {e}")
 
-    try:
-        gstate = _read_json(BASE / "expat_guide_state.json", expected_type=dict)
-        if gstate is None:
-            problems.append("🔴 Гайд экспата: expat_guide_state.json отсутствует или повреждён — бот без него не запустится")
-        else:
-            guide = _read_json(BASE / "expat_guide.json", expected_type=list) or []
-            idx = gstate.get("current_index", 1)
-            if not _valid_index(idx):
-                problems.append(f"🔴 Гайд экспата: current_index в state некорректен ({idx!r})")
-            elif guide:
-                ready = [x for x in guide
-                         if isinstance(x, dict) and isinstance(x.get("id"), int)
-                         and x["id"] >= idx and (x.get("body") or "").strip()]
-                if not ready:
-                    problems.append("🔴 Гайд экспата: нет ни одного готового материала — ближайшее воскресенье будет пропущено")
-                elif len(ready) < GUIDE_RUNWAY_WARN_WEEKS:
-                    problems.append(
-                        f"🟡 Гайд экспата: осталось {len(ready)} материалов "
-                        f"— пора запускать expat_guide_builder.py --id N-M"
-                    )
-                else:
-                    log.info("OK Гайд: запас %d материалов", len(ready))
+    if not guide_disabled:
+        try:
+            gstate = _read_json(BASE / "expat_guide_state.json", expected_type=dict)
+            if gstate is None:
+                problems.append("🔴 Гайд экспата: expat_guide_state.json отсутствует или повреждён — бот без него не запустится")
+            else:
+                guide = _read_json(BASE / "expat_guide.json", expected_type=list) or []
+                idx = gstate.get("current_index", 1)
+                if not _valid_index(idx):
+                    problems.append(f"🔴 Гайд экспата: current_index в state некорректен ({idx!r})")
+                elif guide:
+                    ready = [x for x in guide
+                             if isinstance(x, dict) and isinstance(x.get("id"), int)
+                             and x["id"] >= idx and (x.get("body") or "").strip()]
+                    if not ready:
+                        problems.append("🔴 Гайд экспата: нет ни одного готового материала — ближайшее воскресенье будет пропущено")
+                    elif len(ready) < GUIDE_RUNWAY_WARN_WEEKS:
+                        problems.append(
+                            f"🟡 Гайд экспата: осталось {len(ready)} материалов "
+                            f"— пора запускать expat_guide_builder.py --id N-M"
+                        )
+                    else:
+                        log.info("OK Гайд: запас %d материалов", len(ready))
 
-                # Отдельно: следующий по очереди материал пуст — ровно тот случай,
-                # который три месяца оставался незамеченным
-                nxt = next((x for x in guide if isinstance(x, dict) and x.get("id") == idx), None)
-                if nxt is not None and not (nxt.get("body") or "").strip():
-                    problems.append(
-                        f"🔴 Гайд экспата: следующий материал id={idx} «{nxt.get('title','')[:40]}» пуст — "
-                        "ближайшее воскресенье будет пропущено"
-                    )
-    except Exception as e:  # noqa: BLE001
-        log.exception("Проверка запаса гайда экспата упала")
-        problems.append(f"❓ Проверка «Гайд экспата» упала: {type(e).__name__}: {e}")
+                    # Отдельно: следующий по очереди материал пуст — ровно тот случай,
+                    # который три месяца оставался незамеченным
+                    nxt = next((x for x in guide if isinstance(x, dict) and x.get("id") == idx), None)
+                    if nxt is not None and not (nxt.get("body") or "").strip():
+                        problems.append(
+                            f"🔴 Гайд экспата: следующий материал id={idx} «{nxt.get('title','')[:40]}» пуст — "
+                            "ближайшее воскресенье будет пропущено"
+                        )
+        except Exception as e:  # noqa: BLE001
+            log.exception("Проверка запаса гайда экспата упала")
+            problems.append(f"❓ Проверка «Гайд экспата» упала: {type(e).__name__}: {e}")
 
     return problems
 
@@ -319,12 +347,18 @@ def main() -> int:
     if not heartbeats:
         log.info("heartbeats.json пуст — используем state-файлы и логи")
 
-    problems = check_silence(heartbeats) + check_runway()
+    guide_disabled = _expat_guide_disabled()
+    problems = check_silence(heartbeats, guide_disabled) + check_runway(guide_disabled)
 
     if problems:
         report = "🚨 АВТОПОСТИНГ — ПРОБЛЕМЫ\n\n" + "\n\n".join(problems)
     else:
         report = "✅ Автопостинг в порядке: все рубрики публикуются, запас контента достаточный"
+
+    if guide_disabled:
+        # Информационная строка: НЕ проблема, в problems не входит и на алерт/код
+        # выхода не влияет (см. _expat_guide_disabled).
+        report += "\n\n⏸ Гайд экспата: выключен в конфиге — не проверяется"
 
     print("=" * 60)
     print(report)

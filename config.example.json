@@ -33,6 +33,7 @@
     "state_file": "vietnamese_state.json"
   },
   "expat_guide": {
+    "enabled": true,
     "thread_id": 1,
     "guide_file": "expat_guide.json",
     "state_file": "expat_guide_state.json"
