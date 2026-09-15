@@ -31,7 +31,6 @@ from dedup import extract_fingerprint
 from dedup import load_tracker as _dedup_load_tracker
 from dedup import save_tracker as _dedup_save_tracker
 from dedup import acquire_lock, tracker_lock_path as _dedup_lock_path
-from dedup import _posted_at_key  # noqa: F401 — используется в h6_reader_merge.py как RH._posted_at_key
 
 logging.basicConfig(
     level=logging.INFO,

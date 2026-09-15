@@ -20,7 +20,6 @@ from pathlib import Path
 import requests
 from bs4 import BeautifulSoup
 
-from facebook_poster import send_facebook_post
 from telegram_sender import HEARTBEAT_PATH, SendOutcomeUnknown, send_rich_message, send_telegram_message
 
 # ---------------------------------------------------------------------------
@@ -867,9 +866,9 @@ def main():
     rich_mode = "--plain" not in sys.argv
     rich_style = "list" if "--rich-list" in sys.argv else "table"
     if dry_run:
-        log.info("DRY RUN mode — Telegram/Facebook отправка отключена")
+        log.info("DRY RUN mode — Telegram отправка отключена")
     if test_mode:
-        log.info("TEST mode — постим в тестовую группу, Facebook пропускаем")
+        log.info("TEST mode — постим в тестовую группу")
     if force:
         log.info("FORCE mode — игнорируем защиту от повторной публикации за сегодня")
     if rich_mode:
@@ -1014,10 +1013,6 @@ def main():
     if not msg_id:
         log.error("Failed to send to Telegram")
         sys.exit(1)
-
-    # В тестовом режиме на Facebook ничего не публикуем — это боевой канал
-    if not test_mode:
-        send_facebook_post(cfg, post_text)
 
 
 if __name__ == "__main__":

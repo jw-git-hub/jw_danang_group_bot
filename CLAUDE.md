@@ -1,6 +1,6 @@
 # CLAUDE.md — Инструкции для Claude Code
 
-⚠️ Запуск бота без флагов = публикация в боевую группу. Без явной команды владельца в группу ничего не публиковать. Текущее состояние (в т.ч. пауза автопостинга с 2026-08-22) — в JOURNAL.md.
+⚠️ Запуск бота без флагов = публикация в боевую группу. Без явной команды владельца в группу ничего не публиковать. Текущее состояние — в JOURNAL.md.
 
 ## Проект
 Telegram-боты для группы "РУССКИЙ ДАНАНГ" (@rus_danang, chat_id -100XXXXXXXXXX, форум с темами).
@@ -20,7 +20,6 @@ Telegram-боты для группы "РУССКИЙ ДАНАНГ" (@rus_danang
 - **rich_render.py** — конвертер плоского поста в Rich HTML для новостей, уроков и гайда (погода строит rich сама, см. `format_post_rich` в weather_bot.py)
 - **article_image.py** — скачивание картинки статьи во временный файл, удаляется сразу после отправки
 - **dedup.py** — трёхуровневая дедупликация новостей
-- **facebook_poster.py** — кросспост дайджеста и новостей на Facebook-страницу
 
 ## Архитектура
 - Бот-аккаунт (@rus_danang_bot) — только для постинга
@@ -37,7 +36,7 @@ Telegram-боты для группы "РУССКИЙ ДАНАНГ" (@rus_danang
 - **Анти-бан Telethon**: `FloodWaitError` → выход с кодом 1 без ожидания (cron-джоб; Telegram может попросить ждать часами), чтение ограничено 200 сообщениями за проход, сессия переиспользуется.
 - **Отправка в Telegram** (`telegram_sender.py`): Повтор (до трёх попыток) — только при 429 и когда соединение не удалось установить (DNS, отказ в соединении, connect-таймаут). Обрыв после отправки запроса, таймаут чтения, ошибка SSL или редиректов, 5xx, неразбираемый ответ — «исход неизвестен» (`SendOutcomeUnknown`): без повтора и без запасного варианта, state не двигается, код выхода 1; новость с таким исходом пишется в трекер с `uncertain`. Публикующие боты берут `flock` (weather_bot, news_bot, vietnamese_bot, expat_guide_bot); news_bot и read_history.py делят один лок на файл трекера; `vietnamese_lesson_builder.py` лочит `vietnamese_lessons.json`.
 - **thread_id=1** не работает в форумных группах — для General не передавать message_thread_id
-- **Флаги и коды выхода**: weather_bot: `--dry-run --test --force --plain --rich-list`; news_bot: `--test --force --init`; vietnamese_bot и expat_guide_bot: `--dry-run --test --force --init --plain`; healthcheck: `--dry-run --always`; read_history: без аргументов; vietnamese_lesson_builder: `--month N --day N[,N] --allow-published --force --preview --limit N`. Коды выхода: 0 — успех, штатный пропуск или лок занят другим запуском; 1 — сбой, исход отправки неизвестен, нет state/трекера без `--init` (у билдера уроков — ещё и занятый лок); 2 — неизвестный флаг, а у уроков и гайда также «опубликовано, но state не сохранён».
+- **Флаги и коды выхода**: weather_bot: `--dry-run --test --force --plain --rich-list`; news_bot: `--test --force --init`; vietnamese_bot и expat_guide_bot: `--dry-run --test --force --init --plain`; healthcheck: `--dry-run --always`; read_history: без аргументов; vietnamese_lesson_builder: `--month N --day N[,N] --allow-published --force --preview --limit N`; expat_guide_builder: `--id N` (или диапазон `--id N-M`) `--preview --force`; guide_verify_apply: `--dir DIR --dry-run`. Коды выхода: 0 — успех, штатный пропуск или лок занят другим запуском; 1 — сбой, исход отправки неизвестен, нет state/трекера без `--init` (у билдера уроков — ещё и занятый лок); 2 — неизвестный флаг, а у уроков и гайда также «опубликовано, но state не сохранён»; у билдера уроков также при некорректных `--month` (не 1..12) или нераспарсенном/пустом списке `--day`.
 
 ## Команды
 ```bash

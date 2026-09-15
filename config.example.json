@@ -17,11 +17,6 @@
     "api_id": 123456,
     "api_hash": "YOUR_TELEGRAM_API_HASH"
   },
-  "facebook": {
-    "enabled": false,
-    "page_id": "YOUR_FACEBOOK_PAGE_ID",
-    "page_access_token": "YOUR_FACEBOOK_PAGE_ACCESS_TOKEN"
-  },
   "news": {
     "max_age_days": 3,
     "dedup_threshold": 0.35,

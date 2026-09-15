@@ -34,7 +34,6 @@ from dedup import is_duplicate, extract_fingerprint, _strip_publisher_suffix
 from dedup import load_tracker as _dedup_load_tracker
 from dedup import save_tracker as _dedup_save_tracker
 from dedup import acquire_lock, tracker_lock_path as _dedup_lock_path
-from facebook_poster import send_facebook_post
 from telegram_sender import send_rich_message, send_telegram_message, SendOutcomeUnknown
 from rich_render import plain_to_rich_html
 from article_image import downloaded_image, mime_for
@@ -914,12 +913,6 @@ def main():
     if not msg_id:
         log.error("Failed to send to Telegram. Aborting.")
         sys.exit(1)
-
-    # Facebook только ПОСЛЕ подтверждения, что Telegram принял пост: иначе при
-    # отказе Telegram новость улетала бы в FB, трекер не обновлялся, и следующий
-    # запуск публиковал бы её в FB повторно.
-    if not test_mode:
-        send_facebook_post(cfg, post_text)
 
     # Тестовый прогон не трогает трекер: иначе реальная статья пометилась бы
     # опубликованной и боевой запуск молча пропустил бы её как дубль.
