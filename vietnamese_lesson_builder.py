@@ -77,6 +77,9 @@ MAX_ATTEMPTS = 3
 # ещё ~90 обречённых вызовов подряд.
 MAX_CONSECUTIVE_RC_FAILURES = 3
 
+# Урок по шаблону — Sonnet достаточно; без явной модели claude -p берёт Opus из глобальных настроек и зря тратит лимиты
+CLAUDE_MODEL = "sonnet"
+
 # Лимит длины отрендеренного поста в UTF-16 code units (так Telegram считает длину
 # сообщения; см. vietnamese_bot._utf16_len) — с запасом от TELEGRAM_MAX_LEN=4096.
 MAX_POST_UTF16_LEN = 3800
@@ -245,8 +248,8 @@ LESSON_TOPICS: dict[int, list[str]] = {
         "Điện bị cúp (Отключили электричество)",
         "Wifi không hoạt động (Не работает Wi-Fi)",
         "Máy lạnh hỏng rồi (Кондиционер сломался)",
-        "Cần sửa chữa (Нужен ремонт)",
-        "Gọi thợ điện (Вызовите электрика)",
+        "Bóng đèn bị cháy (Перегорела лампочка)",
+        "Ổ cắm không có điện, gọi thợ điện (Не работает розетка — вызовите электрика)",
         "Gọi thợ ống nước (Вызовите сантехника)",
         "Khoá bị hỏng (Замок сломан)",
         "Tôi mất chìa khoá (Я потерял ключ)",
@@ -257,8 +260,8 @@ LESSON_TOPICS: dict[int, list[str]] = {
         "Đổ rác ở đâu? (Где выбрасывать мусор?)",
         "Khi nào lấy rác? (Когда забирают мусор?)",
         "Bảo vệ (Охрана)",
-        "Chủ nhà (Хозяин квартиры)",
-        "Chuyển đi (Съезжать)",
+        "Không có nước nóng (Нет горячей воды)",
+        "Gia hạn hợp đồng (Продлить договор аренды)",
         "Trả phòng (Сдать квартиру)",
     ],
     6: [
@@ -726,7 +729,7 @@ def call_claude(prompt: str, timeout: int = 240) -> Optional[dict]:
     global _consecutive_rc_failures
     try:
         result = subprocess.run(
-            ["claude", "-p", prompt, "--strict-mcp-config", "--tools", ""],
+            ["claude", "-p", prompt, "--model", CLAUDE_MODEL, "--strict-mcp-config", "--tools", ""],
             capture_output=True,
             text=True,
             timeout=timeout,
@@ -942,6 +945,20 @@ def _mixed_script_tokens(text: str) -> list[str]:
     return bad
 
 
+# В кириллической транскрипции из комбинирующих знаков допустим только знак ударения;
+# остальные (точка снизу, гравис, крючок, тильда…) — вьетнамские тоновые знаки, попавшие
+# на русские буквы («ла̣йнь», «вэ̀»). _mixed_script_tokens их не видит: категория M игнорируется.
+STRESS_MARK = "\u0301"
+
+
+def _stray_mark_tokens(text: str) -> list[str]:
+    """Токены (через пробел), содержащие комбинирующий знак, отличный от знака ударения."""
+    return [
+        token for token in text.split()
+        if any(unicodedata.category(ch) == "Mn" and ch != STRESS_MARK for ch in token)
+    ]
+
+
 def content_defects(record: dict) -> list[str]:
     """Признаки того, что текстовые поля урока содержат самокоррекцию/служебный мусор
     вместо чистого содержимого, или что кириллическая транскрипция засорена буквами
@@ -965,6 +982,8 @@ def content_defects(record: dict) -> list[str]:
             return
         for token in _mixed_script_tokens(value):
             defects.append(f"{label}: транскрипция смешивает кириллицу с другим алфавитом («{token}»)")
+        for token in _stray_mark_tokens(value):
+            defects.append(f"{label}: вьетнамский тоновый знак в кириллической транскрипции («{token}»)")
 
     for field in _TEXT_FIELDS:
         check_text(field, record.get(field))
