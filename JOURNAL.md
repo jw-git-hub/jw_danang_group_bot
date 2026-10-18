@@ -1,5 +1,16 @@
 # Journal
 
+## 2026-10-18 — Погода перенесена в тему «Новости»
+
+По просьбе владельца посты `weather_bot.py` переехали из General в тему «Новости» (https://t.me/rus_danang/1451).
+
+**Сделано:**
+- Код менять не пришлось: `weather_bot.py` читает `config.json["telegram"]["weather_thread_id"]`, `telegram_sender.py` передаёт `message_thread_id` для любой темы, кроме General (0 или 1).
+- В `config.json` `telegram.weather_thread_id` изменён с `1` на `1451`. Коммита для этого нет — `config.json` в `.gitignore`. Откат — вернуть `1`.
+
+**Осталось:**
+- `--test` подмену темы не проверяет (шлёт в test_chat_id/test_thread_id) — реальная маршрутизация подтвердится следующим боевым запуском `weather_bot.py`.
+
 ## 2026-09-27 — Сгенерирован месяц 5 уроков (дни 121–150)
 
 **Сделано:**
