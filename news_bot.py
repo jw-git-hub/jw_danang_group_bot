@@ -36,6 +36,7 @@ from dedup import save_tracker as _dedup_save_tracker
 from dedup import acquire_lock, tracker_lock_path as _dedup_lock_path
 from telegram_sender import send_rich_message, send_telegram_message, SendOutcomeUnknown
 from rich_render import plain_to_rich_html
+from language_check import find_latin_leaks
 from article_image import downloaded_image, mime_for
 
 # googlenewsdecoder делает requests.get/post без timeout — при недоступности
@@ -441,6 +442,7 @@ CLAUDE_PROMPT = """Ты — редактор новостного Telegram-ка�
 
 Правила:
 - Живой русский язык, не калька с английского
+- Весь текст только по-русски: не вставляй английские слова и англицизмы латиницей (regularly, museums, must-see, check-in, fine dining, vs и т.п.) — переводи их. Латиница допустима только в названиях компаний, брендов, отелей, сайтов, в аббревиатурах и во вьетнамских названиях в скобках. Не смешивай в одном слове латинские и русские буквы
 - Каждый абзац начинается с тематического эмодзи
 - Обязательно абзац «Для экспатов» с эмодзи 🌴
 - Обязательно строка «📰 Источник: URL» — URL не менять
@@ -457,6 +459,12 @@ CLAUDE_PROMPT = """Ты — редактор новостного Telegram-ка�
 Текст статьи:
 {text}
 """
+
+# Промпт-правка: пост с латиницей-протечками отдаётся модели на исправление
+# (одна попытка), чтобы не терять статью из-за пары английских слов
+LATIN_FIX_PROMPT = """Ниже готовый пост для Telegram-канала на русском. В нём остались слова латиницей, которые надо передать по-русски: {leaks}. Замени только их (переведи; названия-аббревиатуры можно оставить), всё остальное — эмодзи, абзацы, строку «📰 Источник: …», хэштеги — оставь без изменений. Выведи ТОЛЬКО исправленный пост, без комментариев.
+
+{post}"""
 
 # Диапазоны эмодзи (см. _is_emoji_char) — дополняются unicodedata, но
 # оставлены явно: категория "So" не покрывает часть Dingbats/стрелок, уже
@@ -620,24 +628,18 @@ def _validate_post(post_text, article, year):
         if not _starts_with_emoji(s) and OPENER_CHATTER_RE.search(s):
             return f"похоже на реплику модели: {line[:80]!r}"
 
+    leaks = find_latin_leaks(post_text)
+    if leaks:
+        return f"английские слова в тексте: {leaks[:5]}"
+
     if len(post_text) > 4000:
         return f"слишком длинный ({len(post_text)} символов > 4000) — отклоняем, а не обрезаем"
 
     return None
 
 
-def generate_post(cfg, article, meta):
-    """Use Claude Code CLI (claude -p) to translate and format the news post."""
-    article_text = meta.get("article_text") or meta.get("og_description") or article["title"]
-    year = datetime.now(DANANG_TZ).year
-
-    prompt = CLAUDE_PROMPT.format(
-        url=article["url"],
-        title=article["title"],
-        text=article_text,
-        year=year,
-    )
-
+def _run_claude(prompt):
+    """Один вызов claude -p. Возвращает stdout или None при любом сбое."""
     try:
         result = subprocess.run(
             # --strict-mcp-config и --tools "" — ПОСЛЕДНИМИ аргументами, ничего
@@ -667,22 +669,11 @@ def generate_post(cfg, article, meta):
                       (result.stderr or "")[:500].strip() or "<пусто>")
             return None
 
-        post_text = result.stdout.strip()
-        post_text = clean_ai_output(post_text)
-
         # Log stderr even on success
         if result.stderr:
             log.warning("Claude stderr (rc=0): %s", result.stderr[:500])
 
-        log.info("Claude generated post: %d chars", len(post_text))
-        log.debug("Post preview: %.200s", post_text)
-
-        fail_reason = _validate_post(post_text, article, year)
-        if fail_reason:
-            log.error("Пост не прошёл проверку формата (%s). Preview: %.200s", fail_reason, post_text)
-            return None
-
-        return post_text
+        return result.stdout.strip()
     except subprocess.TimeoutExpired:
         log.error("Claude Code CLI timed out (120s)")
         return None
@@ -692,6 +683,52 @@ def generate_post(cfg, article, meta):
     except Exception as e:
         log.error("Claude Code error: %s", e)
         return None
+
+
+def _fix_latin_leaks(post_text, leaks):
+    """Одна доп. попытка: модель переводит найденную латиницу. Возвращает
+    исправленный пост или None, если вызов не удался."""
+    fixed_raw = _run_claude(LATIN_FIX_PROMPT.format(leaks=", ".join(leaks), post=post_text))
+    if fixed_raw is None:
+        return None
+    return clean_ai_output(fixed_raw)
+
+
+def generate_post(cfg, article, meta):
+    """Use Claude Code CLI (claude -p) to translate and format the news post."""
+    article_text = meta.get("article_text") or meta.get("og_description") or article["title"]
+    year = datetime.now(DANANG_TZ).year
+
+    prompt = CLAUDE_PROMPT.format(
+        url=article["url"],
+        title=article["title"],
+        text=article_text,
+        year=year,
+    )
+
+    raw_output = _run_claude(prompt)
+    if raw_output is None:
+        return None
+    post_text = clean_ai_output(raw_output)
+
+    log.info("Claude generated post: %d chars", len(post_text))
+    log.debug("Post preview: %.200s", post_text)
+
+    leaks = find_latin_leaks(post_text)
+    if leaks:
+        log.warning("Латиница в тексте поста: %s — просим модель исправить", leaks)
+        fixed_text = _fix_latin_leaks(post_text, leaks)
+        if fixed_text is None:
+            return None
+        log.info("Правка латиницы: осталось %s", find_latin_leaks(fixed_text) or "ничего")
+        post_text = fixed_text
+
+    fail_reason = _validate_post(post_text, article, year)
+    if fail_reason:
+        log.error("Пост не прошёл проверку формата (%s). Preview: %.200s", fail_reason, post_text)
+        return None
+
+    return post_text
 
 # ---------------------------------------------------------------------------
 # Telegram
