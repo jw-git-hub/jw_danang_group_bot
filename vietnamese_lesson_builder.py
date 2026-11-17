@@ -277,7 +277,7 @@ LESSON_TOPICS: dict[int, list[str]] = {
         "Bệnh viện ở đâu? (Где больница?)",
         "Hiệu thuốc gần nhất (Ближайшая аптека)",
         "Có thuốc giảm đau không? (Есть обезболивающее?)",
-        "Thuốc kháng sinh (Антибиотики)",
+        "Thuốc này có phải là kháng sinh không? (Это антибиотик? Спросить в аптеке)",
         "Đau ở đây (Болит здесь)",
         "Tôi bị thương (Я поранился)",
         "Cần băng cứu thương (Нужны бинты)",
