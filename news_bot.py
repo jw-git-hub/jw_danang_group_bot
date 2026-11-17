@@ -38,6 +38,7 @@ from telegram_sender import send_rich_message, send_telegram_message, SendOutcom
 from rich_render import plain_to_rich_html
 from language_check import find_latin_leaks
 from article_image import downloaded_image, mime_for
+from digest import is_digest, pick_local_image
 
 # googlenewsdecoder делает requests.get/post без timeout — при недоступности
 # или троттлинге Google одно подвисшее соединение способно повесить весь
@@ -409,10 +410,35 @@ def extract_article_meta(url):
             "og_description": og_desc,
             "og_title": og_title,
             "article_text": article_text[:5000],  # Limit for Claude context
+            # Для дайджеста-подборки og_image относится к чужому сюжету (см. digest.py)
+            "local_image": pick_local_image(soup, url),
         }
     except Exception as e:
         log.warning("Failed to extract article meta from %s: %s", url, e)
-        return {"og_image": None, "og_description": None, "og_title": None, "article_text": ""}
+        return {"og_image": None, "og_description": None, "og_title": None,
+                "article_text": "", "local_image": None}
+
+# ---------------------------------------------------------------------------
+# Дайджесты-подборки (см. digest.py)
+# ---------------------------------------------------------------------------
+def _is_digest_article(article, meta):
+    """Подборку видно по заголовку из поиска или по og:title самой страницы."""
+    return is_digest(article["title"]) or is_digest(meta.get("og_title") or "")
+
+
+def select_post_image(article, meta):
+    """URL картинки для поста. У обычной статьи — og:image. У подборки og:image
+    относится к первому сюжету, а пост пишется про дананговский, поэтому берём
+    картинку с подписью про Дананг; нет такой — публикуем без картинки."""
+    if not _is_digest_article(article, meta):
+        return meta.get("og_image")
+    local_image = meta.get("local_image")
+    if local_image:
+        log.info("Дайджест: вместо og:image берём картинку с подписью про Дананг: %s", local_image)
+    else:
+        log.warning("Дайджест: картинки с подписью про Дананг нет — публикуем без картинки "
+                    "(og:image относится к другой новости подборки)")
+    return local_image
 
 # ---------------------------------------------------------------------------
 # Claude Code CLI — translate & format post
@@ -452,13 +478,22 @@ CLAUDE_PROMPT = """Ты — редактор новостного Telegram-ка�
 - Пустая строка между абзацами
 - НЕ добавляй ссылку на Telegram-группу
 - Выведи ТОЛЬКО текст поста. Начни сразу с эмодзи и заголовка. Без преамбул, комментариев, пояснений, вступлений типа «Вот пост:». Никаких мета-комментариев до или после поста
-- Если текст статьи не совпадает с заголовком — пиши по заголовку и доступной информации, НЕ отказывайся и НЕ пиши пояснения
+- Если текст статьи не совпадает с заголовком — пиши по заголовку и доступной информации, НЕ отказывайся и НЕ пиши пояснения{digest_rule}
 
 Заголовок статьи: {title}
 
 Текст статьи:
 {text}
 """
+
+# Правило для подборки из нескольких новостей (см. digest.py): без него модель
+# пишет пост про любой сюжет подборки, а картинка выбрана по подписи про Дананг —
+# текст и иллюстрация расходятся
+DIGEST_PROMPT_RULE = (
+    "- Это подборка из нескольких разных новостей. Напиши пост только об одной из них — "
+    "о новости про Дананг (если она есть в заголовке подборки — именно о ней). "
+    "Остальные новости подборки не упоминай"
+)
 
 # Промпт-правка: пост с латиницей-протечками отдаётся модели на исправление
 # (одна попытка), чтобы не терять статью из-за пары английских слов
@@ -694,17 +729,24 @@ def _fix_latin_leaks(post_text, leaks):
     return clean_ai_output(fixed_raw)
 
 
-def generate_post(cfg, article, meta):
-    """Use Claude Code CLI (claude -p) to translate and format the news post."""
+def build_post_prompt(article, meta, year):
+    """Промпт для claude -p; для подборки в «Правила» добавляется ещё одно правило
+    (в конец последнего пункта — для обычной статьи промпт остаётся без пустых строк)."""
     article_text = meta.get("article_text") or meta.get("og_description") or article["title"]
-    year = datetime.now(DANANG_TZ).year
-
-    prompt = CLAUDE_PROMPT.format(
+    digest_rule = f"\n{DIGEST_PROMPT_RULE}" if _is_digest_article(article, meta) else ""
+    return CLAUDE_PROMPT.format(
         url=article["url"],
         title=article["title"],
         text=article_text,
         year=year,
+        digest_rule=digest_rule,
     )
+
+
+def generate_post(cfg, article, meta):
+    """Use Claude Code CLI (claude -p) to translate and format the news post."""
+    year = datetime.now(DANANG_TZ).year
+    prompt = build_post_prompt(article, meta, year)
 
     raw_output = _run_claude(prompt)
     if raw_output is None:
@@ -860,7 +902,7 @@ def main():
     had_photo = False
 
     if rich_html:
-        with downloaded_image(meta.get("og_image")) as image_path:
+        with downloaded_image(select_post_image(article, meta)) as image_path:
             had_photo = image_path is not None
             try:
                 msg_id = send_rich_message(
@@ -899,6 +941,7 @@ def main():
         # Откат: обычное сообщение. Картинка тогда приходит превью из ссылки, но
         # крупной она станет только при ЯВНОМ link_preview_options.url — без него
         # Telegram игнорирует prefer_large_media и рисует иконку сбоку.
+        # Для подборки превью выключено: оно подтянуло бы тот же og:image чужого сюжета.
         try:
             msg_id = send_telegram_message(
                 cfg,
@@ -909,6 +952,7 @@ def main():
                 show_above_text=True,
                 test=test_mode,
                 rubric="news",
+                disable_preview=_is_digest_article(article, meta),
             )
         except SendOutcomeUnknown as e:
             log.error(

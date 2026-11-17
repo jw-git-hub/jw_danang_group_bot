@@ -422,6 +422,24 @@ def _require_message_id(method: str, result: dict, bot_token: str) -> int:
     return msg_id
 
 
+def _link_preview_options(
+    link_preview_url: str | None,
+    prefer_large_media: bool,
+    show_above_text: bool,
+    disable_preview: bool,
+) -> dict:
+    if disable_preview:
+        return {"is_disabled": True}
+    preview: dict = {"is_disabled": False}
+    if link_preview_url:
+        preview["url"] = link_preview_url
+        if prefer_large_media:
+            preview["prefer_large_media"] = True
+    if show_above_text:
+        preview["show_above_text"] = True
+    return preview
+
+
 def send_telegram_message(
     cfg: dict,
     text: str,
@@ -432,6 +450,7 @@ def send_telegram_message(
     show_above_text: bool = False,
     test: bool = False,
     rubric: str | None = None,
+    disable_preview: bool = False,
 ) -> int | None:
     """Отправляет обычное сообщение. Возвращает message_id при успехе, None при
     точном отказе. При неопределённом исходе поднимает SendOutcomeUnknown —
@@ -448,17 +467,15 @@ def send_telegram_message(
     link_preview_url: явный URL для превью. Важно: prefer_large_media и
     prefer_small_media Telegram игнорирует, если URL не задан явно, — на одном
     автодетекте первой ссылки крупное превью не включится.
+
+    disable_preview: превью ссылки выключено целиком, остальные опции превью игнорируются.
     """
     bot_token = cfg["telegram"]["bot_token"]
     chat_id, thread_id = resolve_target(cfg, thread_id, test)
 
-    preview: dict = {"is_disabled": False}
-    if link_preview_url:
-        preview["url"] = link_preview_url
-        if prefer_large_media:
-            preview["prefer_large_media"] = True
-    if show_above_text:
-        preview["show_above_text"] = True
+    preview = _link_preview_options(
+        link_preview_url, prefer_large_media, show_above_text, disable_preview,
+    )
 
     payload = {
         "chat_id": chat_id,
