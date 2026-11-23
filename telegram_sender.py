@@ -230,7 +230,8 @@ def _is_establish_failure(exc: BaseException) -> bool:
 
 
 def _post_with_retry(bot_token: str, method: str, payload: dict,
-                     files: dict | None = None) -> dict | None:
+                     files: dict | None = None,
+                     expect_message: bool = True) -> dict | bool | None:
     """POST к Telegram API. Возвращает result при успехе, None при точном отказе.
 
     При неопределённом исходе (см. докстринг модуля) поднимает
@@ -241,6 +242,12 @@ def _post_with_retry(bot_token: str, method: str, payload: dict,
     режиме тело уходит как multipart/form-data, а вложенные объекты вроде
     rich_message приходится сериализовать в JSON-строки вручную — form-data
     не умеет вложенность.
+
+    expect_message=True (по умолчанию) — метод возвращает сообщение: успехом
+    считается ok:true с result-объектом, возвращается этот объект. False — для
+    методов вроде pinChatMessage/deleteMessage, которые отвечают "result": true:
+    успехом считается ok:true с result ровно True, возвращается True; любой
+    другой result — неопределённый исход, как и для сообщений.
     """
     url = f"{API_ROOT}/bot{bot_token}/{method}"
     timeout = (CONNECT_TIMEOUT, READ_TIMEOUT_UPLOAD if files else READ_TIMEOUT)
@@ -386,16 +393,18 @@ def _post_with_retry(bot_token: str, method: str, payload: dict,
                       method, _safe(str(result), bot_token))
             return None
 
-        if not isinstance(result.get("result"), dict):
-            # ok:true, но 'result' отсутствует или не объект (например, {"ok":true}
-            # без result вовсе, или result — список/bool) — не тот ответ, которого
-            # ждут вызывающие (sendMessage/sendRichMessage всегда возвращают Message
-            # как объект). Запрос мог реально дойти и что-то опубликовать — как и
-            # при 5xx/нечитаемом теле выше, это неопределённый исход, а не точный
-            # отказ: KeyError/TypeError ниже по стеку ушли бы необработанными.
-            log.warning("Telegram %s: HTTP %d, ok=true но 'result' отсутствует или не объект — "
+        if not _is_expected_result(result.get("result"), expect_message):
+            # ok:true, но 'result' отсутствует или не того вида (например, {"ok":true}
+            # без result вовсе, или result — список/bool там, где ждут Message) — не тот
+            # ответ, которого ждут вызывающие (sendMessage/sendRichMessage всегда
+            # возвращают Message как объект). Запрос мог реально дойти и что-то
+            # опубликовать — как и при 5xx/нечитаемом теле выше, это неопределённый
+            # исход, а не точный отказ: KeyError/TypeError ниже по стеку ушли бы
+            # необработанными.
+            expected = "объект" if expect_message else "true"
+            log.warning("Telegram %s: HTTP %d, ok=true но 'result' отсутствует или не %s — "
                         "доставка не подтверждена: %s",
-                        method, resp.status_code, _safe(str(result)[:300], bot_token))
+                        method, resp.status_code, expected, _safe(str(result)[:300], bot_token))
             raise SendOutcomeUnknown(_safe(
                 f"Telegram {method}: HTTP {resp.status_code} ok=true, 'result' некорректен: "
                 f"{str(result)[:300]}", bot_token))
@@ -403,6 +412,14 @@ def _post_with_retry(bot_token: str, method: str, payload: dict,
         return result["result"]
 
     return None
+
+
+def _is_expected_result(result_value, expect_message: bool) -> bool:
+    """True, если result ответа — то, чего ждёт вызывающий: объект Message
+    (expect_message=True) либо ровно булево true (expect_message=False)."""
+    if expect_message:
+        return isinstance(result_value, dict)
+    return result_value is True
 
 
 def _require_message_id(method: str, result: dict, bot_token: str) -> int:
@@ -503,6 +520,31 @@ def send_telegram_message(
     return msg_id
 
 
+def _build_rich_message(
+    rich_html: str,
+    photo_path: str | None,
+    photo_mime: str,
+) -> tuple[dict, dict | None]:
+    """Собирает поле rich_message и файлы multipart-запроса для send/edit.
+
+    Без photo_path: ({"html": rich_html}, None). С картинкой она становится
+    частью статьи: файл уходит через attach://, а в разметке на него ссылается
+    медиа-блок по внутреннему id. Так пост выглядит статьёй с иллюстрацией —
+    превью ссылки в rich не работает вовсе, поэтому изображение надо отдавать
+    явно. Одна сборка на отправку и правку — иначе они разойдутся.
+    """
+    rich: dict = {"html": rich_html}
+    if not photo_path:
+        return rich, None
+    rich["html"] = f'<img src="tg://photo?id={PHOTO_BLOCK_ID}"/>' + rich_html
+    rich["media"] = [{
+        "id": PHOTO_BLOCK_ID,
+        "media": {"type": "photo", "media": f"attach://{PHOTO_ATTACH_NAME}"},
+    }]
+    files = {PHOTO_ATTACH_NAME: (photo_path, "image" + Path(photo_path).suffix, photo_mime)}
+    return rich, files
+
+
 def send_rich_message(
     cfg: dict,
     rich_html: str,
@@ -537,19 +579,7 @@ def send_rich_message(
     bot_token = cfg["telegram"]["bot_token"]
     chat_id, thread_id = resolve_target(cfg, thread_id, test)
 
-    rich: dict = {"html": rich_html}
-    files = None
-    if photo_path:
-        # Картинка становится частью статьи: файл уходит через attach://, а в
-        # разметке на него ссылается медиа-блок по внутреннему id. Так новость
-        # выглядит статьёй с иллюстрацией — превью ссылки в rich не работает
-        # вовсе, поэтому изображение надо отдавать явно.
-        rich["html"] = f'<img src="tg://photo?id={PHOTO_BLOCK_ID}"/>' + rich_html
-        rich["media"] = [{
-            "id": PHOTO_BLOCK_ID,
-            "media": {"type": "photo", "media": f"attach://{PHOTO_ATTACH_NAME}"},
-        }]
-        files = {PHOTO_ATTACH_NAME: (photo_path, "image" + Path(photo_path).suffix, photo_mime)}
+    rich, files = _build_rich_message(rich_html, photo_path, photo_mime)
 
     payload = {
         "chat_id": chat_id,
@@ -570,3 +600,76 @@ def send_rich_message(
     if rubric and not test:
         record_heartbeat(rubric, msg_id)
     return msg_id
+
+
+def edit_rich_message(
+    cfg: dict,
+    message_id: int,
+    rich_html: str,
+    test: bool = False,
+    photo_path: str | None = None,
+    photo_mime: str = "image/jpeg",
+) -> int | None:
+    """Правит ранее отправленное rich-сообщение методом editMessageText.
+
+    editMessageText принимает rich_message и attach:// так же, как
+    sendRichMessage, — картинка при правке загружается заново (multipart),
+    поэтому photo_path нужно передавать каждый раз, иначе правка уберёт
+    картинку из поста. Тема здесь не нужна: сообщение адресуется парой
+    chat_id + message_id. Пульс не пишется — это не новая публикация.
+
+    Возвращает message_id при успехе, None при точном отказе (в том числе
+    "message is not modified" и удалённое сообщение). При неопределённом
+    исходе поднимает SendOutcomeUnknown — вызывающий не должен повторять
+    правку вслепую.
+    """
+    if not rich_html or not rich_html.strip():
+        log.error("edit_rich_message: пустой rich_html, правка не выполняется")
+        return None
+
+    bot_token = cfg["telegram"]["bot_token"]
+    chat_id, _thread_id = resolve_target(cfg, None, test)
+
+    rich, files = _build_rich_message(rich_html, photo_path, photo_mime)
+    payload = {
+        "chat_id": chat_id,
+        "message_id": message_id,
+        "rich_message": rich,
+    }
+
+    result = _post_with_retry(bot_token, "editMessageText", payload, files=files)
+    if result is None:
+        return None
+
+    edited_id = _require_message_id("editMessageText", result, bot_token)
+    log.info("Telegram: edited RICH message_id=%s in chat=%s%s%s",
+             edited_id, chat_id,
+             " +photo" if photo_path else "",
+             " [TEST]" if test else "")
+    return edited_id
+
+
+def pin_message(cfg: dict, message_id: int, test: bool = False) -> bool:
+    """Закрепляет сообщение без уведомления участников (pinChatMessage).
+
+    True при успехе, False при точном отказе (например, у бота нет права
+    закреплять сообщения). pinChatMessage отвечает "result": true, а не
+    сообщением, поэтому запрос идёт с expect_message=False. При неопределённом
+    исходе поднимает SendOutcomeUnknown — закреп мог встать, повторять вслепую
+    не надо, но и вреда от повтора нет: закрепление идемпотентно.
+    """
+    bot_token = cfg["telegram"]["bot_token"]
+    chat_id, _thread_id = resolve_target(cfg, None, test)
+
+    payload = {
+        "chat_id": chat_id,
+        "message_id": message_id,
+        "disable_notification": True,
+    }
+    result = _post_with_retry(bot_token, "pinChatMessage", payload, expect_message=False)
+    if result is None:
+        return False
+
+    log.info("Telegram: pinned message_id=%s in chat=%s%s",
+             message_id, chat_id, " [TEST]" if test else "")
+    return True

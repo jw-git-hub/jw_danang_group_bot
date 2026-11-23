@@ -1,0 +1,425 @@
+{
+ "chat": "@rus_danang",
+ "footer": "Хотите в каталог — напишите @jw_dev_pro",
+ "sections": [
+  {
+   "title": "Деловые услуги",
+   "message_thread_id": 62,
+   "banner": "banners/01-delovye.png",
+   "lead": "Исполнители из нашей группы. Пишите напрямую — ссылка в имени.",
+   "items": [
+    {
+     "name": "Ньунг",
+     "service": "Переводчик рус↔вьет, нотариальный перевод, визы, Fast Track, сопровождение в клиники",
+     "url": "https://t.me/Vietnam_Translator"
+    },
+    {
+     "name": "Роман",
+     "service": "Художник-оформитель: роспись стен в кафе, ресторанах, виллах",
+     "url": "https://t.me/roman_nim"
+    },
+    {
+     "name": "Bao Chau (Екатерина)",
+     "service": "Переводчик рус↔вьет",
+     "url": "https://www.facebook.com/share/1E4RGKxxpw/"
+    },
+    {
+     "name": "Надя",
+     "service": "Видеомонтаж: Reels, Shorts, YouTube",
+     "url": "https://t.me/milonovanadya"
+    },
+    {
+     "name": "jw",
+     "service": "Сайты и Telegram-боты для бизнеса",
+     "url": "https://t.me/jw_dev_pro"
+    }
+   ]
+  },
+  {
+   "title": "Медицина и здоровье",
+   "message_thread_id": 68,
+   "banner": "banners/02-medicina.png",
+   "lead": "Исполнители из нашей группы. Пишите напрямую — ссылка в имени.",
+   "items": [
+    {
+     "name": "Ирина (Neva Neolin)",
+     "service": "Врач-косметолог, Дананг и Самуи",
+     "url": "https://t.me/doctor_cosmetolog_pro"
+    },
+    {
+     "name": "Доктор Минь Минь Куан",
+     "service": "Стоматолог, учился в Волгограде, говорит по-русски",
+     "url": "https://wa.me/84866937161"
+    },
+    {
+     "name": "Citi Dental Clinic",
+     "service": "Стоматология",
+     "url": "https://maps.app.goo.gl/4ST6CVMJBdPRkMDX6"
+    },
+    {
+     "name": "Dr Khoa Le",
+     "service": "Стоматология: коронки, удаление, каналы",
+     "url": "https://t.me/DrKhoaLe"
+    },
+    {
+     "name": "Таблица клиник Дананга",
+     "service": "Рейтинг и цены клиник и стоматологий (от Ньунг)",
+     "url": "https://docs.google.com/spreadsheets/d/1Rn3Jq0zCAxZKXprKJ_tsIslUXDoBFQfqDCVFWr4QlSg/edit?gid=1294533490"
+    },
+    {
+     "name": "Сергей",
+     "service": "Тренажёр «Правило»: осанка, суставы, спина",
+     "url": "https://t.me/Slavic_simulator"
+    }
+   ]
+  },
+  {
+   "title": "Красота и стиль",
+   "message_thread_id": 60,
+   "banner": "banners/03-krasota.png",
+   "lead": "Исполнители из нашей группы. Пишите напрямую — ссылка в имени.",
+   "items": [
+    {
+     "name": "Марина",
+     "service": "Парикмахер, стаж 20 лет",
+     "url": "https://t.me/MARINAELDORADO"
+    },
+    {
+     "name": "Диана",
+     "service": "Маникюр, 8 лет опыта",
+     "url": "https://t.me/diishlgn"
+    },
+    {
+     "name": "Александра",
+     "service": "Перманентный макияж, татуаж, удаление ПМ",
+     "url": "https://t.me/koshkina108"
+    },
+    {
+     "name": "Екатерина",
+     "service": "Сахарная и восковая депиляция, в т.ч. мужская",
+     "url": "https://t.me/Danang_Epilation"
+    },
+    {
+     "name": "Neva Beauty",
+     "service": "Центр красоты",
+     "url": "https://vn.neva.beauty",
+     "featured": true
+    }
+   ]
+  },
+  {
+   "title": "Преподаватели и тренеры",
+   "message_thread_id": 65,
+   "banner": "banners/04-prepodavateli.png",
+   "lead": "Исполнители из нашей группы. Пишите напрямую — ссылка в имени.",
+   "items": [
+    {
+     "name": "Alina Rep",
+     "service": "Английский онлайн для взрослых, разговорная практика",
+     "url": "https://t.me/alinarep"
+    },
+    {
+     "name": "Татьяна",
+     "service": "Английский: деловой, разговорный, для детей",
+     "url": "https://t.me/easyenglishpro"
+    },
+    {
+     "name": "Анастасия",
+     "service": "Английский для начинающих, группы за донейшн",
+     "url": "https://t.me/Nancy_kite"
+    },
+    {
+     "name": "Наталья",
+     "service": "Русский язык, ОГЭ, начальные классы",
+     "url": "https://t.me/tutor_fits"
+    },
+    {
+     "name": "Владислав",
+     "service": "Химия: ЕГЭ, ОГЭ, олимпиады, онлайн",
+     "url": "https://t.me/Vladislav_Noskov"
+    },
+    {
+     "name": "Ксения",
+     "service": "Танцы бачата и сальса, рисование",
+     "url": "https://t.me/ksenia_bachata"
+    },
+    {
+     "name": "Деян Шопин",
+     "service": "Встречи «Субъектика»: язык тела",
+     "url": "https://t.me/tonpardon"
+    }
+   ]
+  },
+  {
+   "title": "Спорт",
+   "message_thread_id": 64,
+   "banner": "banners/05-sport.png",
+   "lead": "Исполнители из нашей группы. Пишите напрямую — ссылка в имени.",
+   "items": [
+    {
+     "name": "Джордж",
+     "service": "Тренер по сёрфингу",
+     "url": "https://t.me/Your_Lucky_Wave"
+    },
+    {
+     "name": "Диана",
+     "service": "Балет, растяжка, пилатес онлайн",
+     "url": "https://t.me/Diana_divana"
+    },
+    {
+     "name": "Enigma Fitness & Yoga",
+     "service": "Зал, йога, бокс, бассейн, сауна — FPT City",
+     "url": "https://t.me/tnghia165"
+    }
+   ]
+  },
+  {
+   "title": "Психологи",
+   "message_thread_id": 66,
+   "banner": "banners/06-psihologi.png",
+   "lead": "Исполнители из нашей группы. Пишите напрямую — ссылка в имени.",
+   "items": [
+    {
+     "name": "Юлия Астанина",
+     "service": "Психоаналитик, групповой аналитик, с 2008 г.",
+     "url": "https://t.me/Jul_Astanina"
+    },
+    {
+     "name": "Мария Новосельцева",
+     "service": "Психолог для эмигрантов",
+     "url": "https://t.me/novoselkovo"
+    }
+   ]
+  },
+  {
+   "title": "Для детей",
+   "message_thread_id": 67,
+   "banner": "banners/07-deti.png",
+   "lead": "Исполнители из нашей группы. Пишите напрямую — ссылка в имени.",
+   "items": [
+    {
+     "name": "Little Party",
+     "service": "Детские праздники, мастер-классы, слайм-пати",
+     "url": "https://t.me/mylittleparty"
+    },
+    {
+     "name": "Анастасия",
+     "service": "Английский для школьников онлайн",
+     "url": "https://wa.me/79937236198"
+    },
+    {
+     "name": "Чат DanangKids",
+     "service": "Кружки и секции для детей",
+     "url": "https://t.me/DanangKids"
+    }
+   ]
+  },
+  {
+   "title": "Праздники и фото",
+   "message_thread_id": 69,
+   "banner": "banners/08-prazdniki.png",
+   "lead": "Исполнители из нашей группы. Пишите напрямую — ссылка в имени.",
+   "items": [
+    {
+     "name": "Blossom Portraits",
+     "service": "Фото и видео прогулки, 1,5 млн за 30 минут",
+     "url": "https://t.me/alencatstone"
+    }
+   ]
+  },
+  {
+   "title": "Эзотерика и практики",
+   "message_thread_id": 71,
+   "banner": "banners/09-ezoterika.png",
+   "lead": "Исполнители из нашей группы. Пишите напрямую — ссылка в имени.",
+   "items": [
+    {
+     "name": "Аня Ананда",
+     "service": "Трансформационная игра Лила",
+     "url": "https://t.me/ann_ananda"
+    },
+    {
+     "name": "Кристина",
+     "service": "Онлайн-йога",
+     "url": "https://t.me/oc_belskaya"
+    },
+    {
+     "name": "Сергей",
+     "service": "Тантра, медитации, встречи",
+     "url": "https://t.me/Tantra_Bliss"
+    },
+    {
+     "name": "Touch Energy",
+     "service": "Звуковая практика Ом",
+     "url": "https://t.me/boginja_svetlaja"
+    },
+    {
+     "name": "Алина Андержанова",
+     "service": "Таролог, консультации",
+     "url": "https://t.me/toytrigger"
+    }
+   ]
+  },
+  {
+   "title": "Развлечения и события",
+   "message_thread_id": 54,
+   "banner": "banners/10-razvlecheniya.png",
+   "lead": "Исполнители из нашей группы. Пишите напрямую — ссылка в имени.",
+   "items": [
+    {
+     "name": "Ксения",
+     "service": "Бачата: Lady Bachata, парные мастер-классы",
+     "url": "https://t.me/ksenia_bachata"
+    },
+    {
+     "name": "Саша",
+     "service": "Дегустации чая, огненное шоу (пои)",
+     "url": "https://t.me/lex_dzen"
+    },
+    {
+     "name": "Den Venturi",
+     "service": "Мото-путешествия по Вьетнаму",
+     "url": "https://t.me/denkoval"
+    },
+    {
+     "name": "Чистый Вьетнам",
+     "service": "Сообщество: совместные уборки природы",
+     "url": "https://t.me/+Zb1IajebBkVkYTgy"
+    },
+    {
+     "name": "LHIFF",
+     "service": "Фестиваль короткометражного кино",
+     "url": "https://t.me/Aneski4"
+    },
+    {
+     "name": "Cloud Hookah Lounge",
+     "service": "Кальянная, кинопоказы",
+     "url": "https://t.me/cloud_hookah_danang"
+    },
+    {
+     "name": "Александра",
+     "service": "Встречи Forge90 по психологии стресса",
+     "url": "https://t.me/kulikovssskaya"
+    },
+    {
+     "name": "Юрий Кузнецов",
+     "service": "Русскоговорящий гид, 18 лет во Вьетнаме",
+     "url": "https://t.me/KuznetsovGuideVn"
+    }
+   ]
+  },
+  {
+   "title": "Поиск жилья",
+   "message_thread_id": 43,
+   "banner": "banners/11-zhilyo.png",
+   "lead": "Исполнители из нашей группы. Пишите напрямую — ссылка в имени.",
+   "items": [
+    {
+     "name": "Triều",
+     "service": "Брокер по аренде жилья",
+     "url": "https://zalo.me/0985744407"
+    },
+    {
+     "name": "Danang House",
+     "service": "Аренда жилья",
+     "url": "https://t.me/Danang_House"
+    },
+    {
+     "name": "Риэлтор (WhatsApp)",
+     "service": "Подбор жилья под запрос",
+     "url": "https://wa.me/84878834343"
+    },
+    {
+     "name": "Serene Stay",
+     "service": "Квартиры в центре, от 3 месяцев",
+     "url": "https://t.me/Serene_Stay_Apartment"
+    }
+   ]
+  },
+  {
+   "title": "Транспорт",
+   "message_thread_id": 53,
+   "banner": "banners/12-transport.png",
+   "lead": "Исполнители из нашей группы. Пишите напрямую — ссылка в имени.",
+   "items": [
+    {
+     "name": "Аренда байка Дананг",
+     "service": "Honda PCX: 250k/день, 3,8 млн/мес",
+     "url": "https://t.me/danang_bike_rent_admin"
+    }
+   ]
+  },
+  {
+   "title": "Визы",
+   "message_thread_id": 46,
+   "banner": "banners/13-vizy.png",
+   "lead": "Исполнители из нашей группы. Пишите напрямую — ссылка в имени.",
+   "items": [
+    {
+     "name": "Ньунг",
+     "service": "Срочные визы, продление, визараны",
+     "url": "https://t.me/Vietnam_Translator"
+    },
+    {
+     "name": "Визараны (Zalo)",
+     "service": "Визараны, работает в Нячанге",
+     "url": "https://zalo.me/84915050903"
+    }
+   ]
+  },
+  {
+   "title": "Обмен валюты",
+   "message_thread_id": 57,
+   "banner": "banners/14-obmen.png",
+   "lead": "Исполнители из нашей группы. Пишите напрямую — ссылка в имени.",
+   "items": [
+    {
+     "name": "Ювелирная лавка у рынка",
+     "service": "Лучший курс наличных, по опыту админа",
+     "url": "https://maps.app.goo.gl/UiGrXDUirzgEv6P7A"
+    }
+   ]
+  },
+  {
+   "title": "Еда",
+   "message_thread_id": 829,
+   "banner": "banners/15-eda.png",
+   "lead": "Исполнители из нашей группы. Пишите напрямую — ссылка в имени.",
+   "items": [
+    {
+     "name": "Пельмени и котлеты",
+     "service": "Домашние пельмени и полуфабрикаты",
+     "url": "https://t.me/DaNang_pelmeshki"
+    },
+    {
+     "name": "Лавка вкусов",
+     "service": "Готовые домашние продукты: блины, паштеты, хумус",
+     "url": "https://t.me/LavkaVkusovBot/homemadefood"
+    },
+    {
+     "name": "Ореховые пасты",
+     "service": "Шесть видов ореховых паст без добавок",
+     "url": "https://t.me/Sergeiblagvegan"
+    }
+   ]
+  },
+  {
+   "title": "Услуги для дома",
+   "message_thread_id": 72,
+   "banner": "banners/16-dom.png",
+   "lead": "Исполнители из нашей группы. Пишите напрямую — ссылка в имени.",
+   "items": [
+    {
+     "name": "Alex Smit",
+     "service": "Портной: подгонка одежды на дому, сумки на заказ",
+     "url": "https://t.me/AlexQualityCreative"
+    },
+    {
+     "name": "Роман",
+     "service": "Роспись стен, оформление интерьеров",
+     "url": "https://t.me/roman_nim"
+    }
+   ]
+  }
+ ]
+}
