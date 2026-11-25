@@ -93,6 +93,14 @@ HEARTBEAT_PATH = Path(__file__).parent / "heartbeats.json"
 # (tg://photo?id=...), attach-имя — поле multipart-запроса с самим файлом.
 PHOTO_BLOCK_ID = "hero"
 PHOTO_ATTACH_NAME = "hero_file"
+PHOTO_TAG = f'<img src="tg://photo?id={PHOTO_BLOCK_ID}"/>'
+PHOTO_MEDIA_TYPE = "photo"
+PHOTO_FILENAME_STEM = "image"
+# Заглавная анимация (MP4 без звука, как GIF): тот же блок и attach-имя, но тег <video>
+# и тип animation; имя файла в multipart — собственное имя MP4.
+ANIMATION_TAG = f'<video src="tg://video?id={PHOTO_BLOCK_ID}"></video>'
+ANIMATION_MEDIA_TYPE = "animation"
+ANIMATION_MIME = "video/mp4"
 
 
 def record_heartbeat(rubric: str, message_id: int, path: Path = HEARTBEAT_PATH) -> None:
@@ -520,29 +528,58 @@ def send_telegram_message(
     return msg_id
 
 
+def _rich_with_media(
+    rich_html: str,
+    media_tag: str,
+    media_type: str,
+    media_path: str,
+    upload_name: str,
+    mime: str,
+) -> tuple[dict, dict]:
+    """Rich-поле с заглавным медиа-блоком: тег в начале разметки, файл — через attach://."""
+    rich = {
+        "html": media_tag + rich_html,
+        "media": [{
+            "id": PHOTO_BLOCK_ID,
+            "media": {"type": media_type, "media": f"attach://{PHOTO_ATTACH_NAME}"},
+        }],
+    }
+    files = {PHOTO_ATTACH_NAME: (media_path, upload_name, mime)}
+    return rich, files
+
+
 def _build_rich_message(
     rich_html: str,
     photo_path: str | None,
     photo_mime: str,
+    animation_path: str | None = None,
 ) -> tuple[dict, dict | None]:
     """Собирает поле rich_message и файлы multipart-запроса для send/edit.
 
-    Без photo_path: ({"html": rich_html}, None). С картинкой она становится
-    частью статьи: файл уходит через attach://, а в разметке на него ссылается
-    медиа-блок по внутреннему id. Так пост выглядит статьёй с иллюстрацией —
-    превью ссылки в rich не работает вовсе, поэтому изображение надо отдавать
-    явно. Одна сборка на отправку и правку — иначе они разойдутся.
+    Без медиа: ({"html": rich_html}, None). С картинкой или анимацией (MP4) она
+    становится частью статьи: файл уходит через attach://, а в разметке на него
+    ссылается медиа-блок по внутреннему id. Так пост выглядит статьёй с
+    иллюстрацией — превью ссылки в rich не работает вовсе, поэтому изображение
+    надо отдавать явно. Одна сборка на отправку и правку — иначе они разойдутся.
+
+    photo_path и animation_path вместе — ValueError: у поста одна заглавная
+    картинка. Проверка идёт до любого сетевого запроса.
     """
-    rich: dict = {"html": rich_html}
-    if not photo_path:
-        return rich, None
-    rich["html"] = f'<img src="tg://photo?id={PHOTO_BLOCK_ID}"/>' + rich_html
-    rich["media"] = [{
-        "id": PHOTO_BLOCK_ID,
-        "media": {"type": "photo", "media": f"attach://{PHOTO_ATTACH_NAME}"},
-    }]
-    files = {PHOTO_ATTACH_NAME: (photo_path, "image" + Path(photo_path).suffix, photo_mime)}
-    return rich, files
+    if photo_path and animation_path:
+        raise ValueError("photo_path и animation_path вместе нельзя: у поста одно заглавное медиа")
+    if animation_path:
+        return _rich_with_media(rich_html, ANIMATION_TAG, ANIMATION_MEDIA_TYPE,
+                                animation_path, Path(animation_path).name, ANIMATION_MIME)
+    if photo_path:
+        return _rich_with_media(rich_html, PHOTO_TAG, PHOTO_MEDIA_TYPE, photo_path,
+                                PHOTO_FILENAME_STEM + Path(photo_path).suffix, photo_mime)
+    return {"html": rich_html}, None
+
+
+def _media_log_label(photo_path: str | None, animation_path: str | None) -> str:
+    if animation_path:
+        return " +animation"
+    return " +photo" if photo_path else ""
 
 
 def send_rich_message(
@@ -553,6 +590,7 @@ def send_rich_message(
     rubric: str | None = None,
     photo_path: str | None = None,
     photo_mime: str = "image/jpeg",
+    animation_path: str | None = None,
 ) -> int | None:
     """Отправляет rich-сообщение (Bot API 10.1+) методом sendRichMessage.
 
@@ -564,6 +602,9 @@ def send_rich_message(
     Внимание: у sendRichMessage НЕТ link_preview_options, и документация не
     определяет, генерируется ли превью для ссылки внутри rich-сообщения. Для
     постов, которые держатся на превью (новости), это проверяется эмпирически.
+
+    animation_path — путь к MP4: заглавная анимация вместо картинки (photo_path и
+    animation_path вместе — ValueError до запроса).
 
     Возвращает message_id при успехе, None при точном отказе. При неопределённом
     исходе поднимает SendOutcomeUnknown — вызывающий обязан её поймать и не
@@ -579,7 +620,7 @@ def send_rich_message(
     bot_token = cfg["telegram"]["bot_token"]
     chat_id, thread_id = resolve_target(cfg, thread_id, test)
 
-    rich, files = _build_rich_message(rich_html, photo_path, photo_mime)
+    rich, files = _build_rich_message(rich_html, photo_path, photo_mime, animation_path)
 
     payload = {
         "chat_id": chat_id,
@@ -595,7 +636,7 @@ def send_rich_message(
     msg_id = _require_message_id("sendRichMessage", result, bot_token)
     log.info("Telegram: sent RICH message_id=%s to chat=%s thread=%s%s%s",
              msg_id, chat_id, payload.get("message_thread_id", "General"),
-             " +photo" if photo_path else "",
+             _media_log_label(photo_path, animation_path),
              " [TEST]" if test else "")
     if rubric and not test:
         record_heartbeat(rubric, msg_id)
@@ -609,13 +650,14 @@ def edit_rich_message(
     test: bool = False,
     photo_path: str | None = None,
     photo_mime: str = "image/jpeg",
+    animation_path: str | None = None,
 ) -> int | None:
     """Правит ранее отправленное rich-сообщение методом editMessageText.
 
     editMessageText принимает rich_message и attach:// так же, как
     sendRichMessage, — картинка при правке загружается заново (multipart),
-    поэтому photo_path нужно передавать каждый раз, иначе правка уберёт
-    картинку из поста. Тема здесь не нужна: сообщение адресуется парой
+    поэтому photo_path (или animation_path) нужно передавать каждый раз, иначе
+    правка уберёт картинку из поста. Тема здесь не нужна: сообщение адресуется парой
     chat_id + message_id. Пульс не пишется — это не новая публикация.
 
     Возвращает message_id при успехе, None при точном отказе (в том числе
@@ -630,7 +672,7 @@ def edit_rich_message(
     bot_token = cfg["telegram"]["bot_token"]
     chat_id, _thread_id = resolve_target(cfg, None, test)
 
-    rich, files = _build_rich_message(rich_html, photo_path, photo_mime)
+    rich, files = _build_rich_message(rich_html, photo_path, photo_mime, animation_path)
     payload = {
         "chat_id": chat_id,
         "message_id": message_id,
@@ -644,7 +686,7 @@ def edit_rich_message(
     edited_id = _require_message_id("editMessageText", result, bot_token)
     log.info("Telegram: edited RICH message_id=%s in chat=%s%s%s",
              edited_id, chat_id,
-             " +photo" if photo_path else "",
+             _media_log_label(photo_path, animation_path),
              " [TEST]" if test else "")
     return edited_id
 

@@ -15,9 +15,12 @@ Telegram-боты для группы "РУССКИЙ ДАНАНГ" (@rus_danang
 - **guide_verify_apply.py** — применение фактчека к материалам гайда
 - **healthcheck.py** — сторож молчания рубрик и запаса контента, алерт в служебный чат
 - **catalog_bot.py** — каталог исполнителей: rich-пост с таблицей «Имя | Услуга» и закреп в каждой из 16 тем (ручной запуск, не cron); данные — `catalog/catalog.json` и `catalog/banners/`, `message_id` тем — в `catalog_state.json`; повторный запуск правит те же посты (`editMessageText`), исполнитель с `"featured": true` выводится блоком «⭐ Рекомендуем» над таблицей
+- **menu_bot.py** — меню-навигатор группы: один rich-пост в General (анимация `menu/radar.mp4`, таблица «Раздел | Что там» со ссылками на разделы группы из `menu/menu.json`, правила) и закреп без уведомления (ручной запуск, не cron); данные — `menu/menu.json`, `message_id` — в `menu_state.json` (ключ `1` — General); повторный запуск правит тот же пост (`editMessageText`), если меню изменилось
 
 Общие модули:
-- **telegram_sender.py** — отправка в Telegram: retry/429, unknown-outcome, хак General-чата, тестовый чат, heartbeats.json
+- **telegram_sender.py** — отправка в Telegram: retry/429, unknown-outcome, хак General-чата, тестовый чат, heartbeats.json; rich с картинкой или MP4-анимацией (`animation_path`), закреп
+- **post_state.py** — state закреплённых постов каталога и меню: запись `uncertain`, атомарная запись файла, карантин битого файла, `open_store` (правила `--init`), flock, `plan_steps` (send/edit/skip/pin), хеш содержимого
+- **pinned_post_sync.py** — движок закреплённого поста для каталога и меню: `PinnedPostSync` (отправка или правка → закреп; пометка `uncertain` до отправки, снятие при точном отказе, CRITICAL при несохранённом state), итог `SyncOutcome`
 - **rich_render.py** — конвертер плоского поста в Rich HTML для новостей, уроков и гайда (погода строит rich сама, см. `format_post_rich` в weather_bot.py)
 - **article_image.py** — скачивание картинки статьи во временный файл, удаляется сразу после отправки
 - **digest.py** — распознавание дайджестов-подборок по заголовку и выбор картинки с подписью про Дананг/Хойан вместо og:image
@@ -37,9 +40,9 @@ Telegram-боты для группы "РУССКИЙ ДАНАНГ" (@rus_danang
 - **Мета-комментарии модели**: любой текст от `claude CLI` перед публикацией — только через `clean_ai_output()` и проверку формата; мета-комментарии модели в посты не пропускать.
 - **Дедупликация** (3 уровня, модуль `dedup.py`): L1 URL exact match → L2 Jaccard/Containment английских заголовков без суффикса издания (порог 0.35) → L3 entity fingerprint (числа + латинские слова + URL slug, без суффикса издания, кросс-языковая RU↔EN, min_overlap=4, min_ratio=0.4). L2/L3 сравнивают только последние 30 дней трекера, L1 — без ограничения по времени. Трекер (`danang-news-posted.json`) хранит последние 1000 записей. URL резолв (googlenewsdecoder) → дедуп → фильтр по возрасту (3 дня) → ранжирование.
 - **Анти-бан Telethon**: `FloodWaitError` → выход с кодом 1 без ожидания (cron-джоб; Telegram может попросить ждать часами), чтение ограничено 200 сообщениями за проход, сессия переиспользуется.
-- **Отправка в Telegram** (`telegram_sender.py`): Повтор (до трёх попыток) — только при 429 и когда соединение не удалось установить (DNS, отказ в соединении, connect-таймаут). Обрыв после отправки запроса, таймаут чтения, ошибка SSL или редиректов, 5xx, неразбираемый ответ — «исход неизвестен» (`SendOutcomeUnknown`): без повтора и без запасного варианта, state не двигается, код выхода 1; новость с таким исходом пишется в трекер с `uncertain`. Публикующие боты берут `flock` (weather_bot, news_bot, vietnamese_bot, expat_guide_bot, catalog_bot); news_bot и read_history.py делят один лок на файл трекера; `vietnamese_lesson_builder.py` лочит `vietnamese_lessons.json`; catalog_bot — `catalog_state.json.lock`. Каталог ещё и пишет пометку `uncertain` темы в state до отправки: тема с ней пропускается, пока владелец не проверит её руками.
+- **Отправка в Telegram** (`telegram_sender.py`): Повтор (до трёх попыток) — только при 429 и когда соединение не удалось установить (DNS, отказ в соединении, connect-таймаут). Обрыв после отправки запроса, таймаут чтения, ошибка SSL или редиректов, 5xx, неразбираемый ответ — «исход неизвестен» (`SendOutcomeUnknown`): без повтора и без запасного варианта, state не двигается, код выхода 1; новость с таким исходом пишется в трекер с `uncertain`. Публикующие боты берут `flock` (weather_bot, news_bot, vietnamese_bot, expat_guide_bot, catalog_bot, menu_bot); news_bot и read_history.py делят один лок на файл трекера; `vietnamese_lesson_builder.py` лочит `vietnamese_lessons.json`; catalog_bot — `catalog_state.json.lock`; menu_bot — `menu_state.json.lock`. Каталог и меню ещё и пишут пометку `uncertain` в state до отправки: тема (у меню — General) с ней пропускается, пока владелец не проверит её руками.
 - **thread_id=1** не работает в форумных группах — для General не передавать message_thread_id
-- **Флаги и коды выхода**: weather_bot: `--dry-run --test --force --plain --rich-list`; news_bot: `--test --force --init`; vietnamese_bot и expat_guide_bot: `--dry-run --test --force --init --plain`; healthcheck: `--dry-run --always`; read_history: без аргументов; vietnamese_lesson_builder: `--month N --day N[,N] --allow-published --force --preview --limit N`; expat_guide_builder: `--id N` (или диапазон `--id N-M`) `--preview --force`; guide_verify_apply: `--dir DIR --dry-run`; catalog_bot: `--dry-run --test --init --thread N[,N]`. Коды выхода: 0 — успех, штатный пропуск или лок занят другим запуском; 1 — сбой, исход отправки неизвестен, нет state/трекера без `--init` (у билдера уроков — ещё и занятый лок; у каталога `--init` нужен, если в state нет записей целевого чата, а ещё 1 — каталог не прошёл проверку); 2 — неизвестный флаг, а у уроков, гайда и каталога также «опубликовано, но state не сохранён»; у билдера уроков также при некорректных `--month` (не 1..12) или нераспарсенном/пустом списке `--day`.
+- **Флаги и коды выхода**: weather_bot: `--dry-run --test --force --plain --rich-list`; news_bot: `--test --force --init`; vietnamese_bot и expat_guide_bot: `--dry-run --test --force --init --plain`; healthcheck: `--dry-run --always`; read_history: без аргументов; vietnamese_lesson_builder: `--month N --day N[,N] --allow-published --force --preview --limit N`; expat_guide_builder: `--id N` (или диапазон `--id N-M`) `--preview --force`; guide_verify_apply: `--dir DIR --dry-run`; catalog_bot: `--dry-run --test --init --thread N[,N]`; menu_bot: `--dry-run --test --init`. Коды выхода: 0 — успех, штатный пропуск или лок занят другим запуском; 1 — сбой, исход отправки неизвестен, нет state/трекера без `--init` (у билдера уроков — ещё и занятый лок; у каталога и меню `--init` нужен, если в state нет записей целевого чата, а ещё 1 — каталог или меню не прошли проверку); 2 — неизвестный флаг, а у уроков, гайда, каталога и меню также «опубликовано, но state не сохранён»; у билдера уроков также при некорректных `--month` (не 1..12) или нераспарсенном/пустом списке `--day`.
 
 ## Команды
 ```bash
@@ -49,15 +52,19 @@ Telegram-боты для группы "РУССКИЙ ДАНАНГ" (@rus_danang
 ./venv/bin/python3 expat_guide_bot.py --dry-run
 ./venv/bin/python3 healthcheck.py --dry-run
 ./venv/bin/python3 catalog_bot.py --dry-run   # план по темам (send/edit/skip/pin) и rich HTML
+./venv/bin/python3 menu_bot.py --dry-run      # план поста меню (send/edit/skip/pin) и rich HTML
 
-# В тестовый чат (telegram.test_chat_id), state не двигается
+# В тестовый чат (telegram.test_chat_id); у этих четырёх ботов state не двигается
 ./venv/bin/python3 weather_bot.py --test
 ./venv/bin/python3 vietnamese_bot.py --test
 ./venv/bin/python3 expat_guide_bot.py --test
 ./venv/bin/python3 news_bot.py --test      # тратит лимиты claude
 
-# Каталог в тестовый чат: state ведётся, но под ключом тестового чата; --init — если для чата записей ещё нет
+# Каталог в тестовый чат (в отличие от команд выше state ведётся — под ключом тестового чата); --init — если для чата записей ещё нет
 ./venv/bin/python3 catalog_bot.py --test --init [--thread 60]
+
+# Меню в тестовый чат: state ведётся под ключом тестового чата, --init — если для чата записей ещё нет
+./venv/bin/python3 menu_bot.py --test --init
 
 # ⚠️ Без флагов — публикация в боевую группу. Неизвестный флаг — выход с кодом 2.
 # Нет state-файла или трекера — бот не стартует; --init только для осознанного старта с нуля.
